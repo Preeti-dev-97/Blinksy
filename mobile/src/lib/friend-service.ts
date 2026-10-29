@@ -18,11 +18,7 @@ export type FriendRequest = {
   addressee: FriendProfile | null;
 };
 
-export type FriendRequestAction =
-  | "send"
-  | "accept"
-  | "reject"
-  | "cancel";
+export type FriendRequestAction = "send" | "accept" | "reject" | "cancel";
 
 const REQUEST_SELECT = `
   id,
@@ -63,9 +59,7 @@ async function requireUser() {
 /**
  * Send a friend request to another profile.
  */
-export async function sendFriendRequest(
-  targetUserId: string,
-): Promise<string> {
+export async function sendFriendRequest(targetUserId: string): Promise<string> {
   const user = await requireUser();
 
   if (!targetUserId || targetUserId === user.id) {
@@ -88,9 +82,7 @@ export async function sendFriendRequest(
 /**
  * Accept an incoming friend request.
  */
-export async function acceptFriendRequest(
-  requestId: string,
-): Promise<void> {
+export async function acceptFriendRequest(requestId: string): Promise<void> {
   await requireUser();
 
   const { error } = await supabase.rpc("accept_friend_request", {
@@ -103,9 +95,7 @@ export async function acceptFriendRequest(
 /**
  * Reject an incoming friend request.
  */
-export async function rejectFriendRequest(
-  requestId: string,
-): Promise<void> {
+export async function rejectFriendRequest(requestId: string): Promise<void> {
   await requireUser();
 
   const { error } = await supabase.rpc("reject_friend_request", {
@@ -118,9 +108,7 @@ export async function rejectFriendRequest(
 /**
  * Cancel a request sent by the current user.
  */
-export async function cancelFriendRequest(
-  requestId: string,
-): Promise<void> {
+export async function cancelFriendRequest(requestId: string): Promise<void> {
   await requireUser();
 
   const { error } = await supabase.rpc("cancel_friend_request", {
@@ -176,9 +164,7 @@ export async function getFriends(): Promise<FriendProfile[]> {
     .from("friend_requests")
     .select(REQUEST_SELECT)
     .eq("status", "accepted")
-    .or(
-      `requester_id.eq.${user.id},addressee_id.eq.${user.id}`,
-    )
+    .or(`requester_id.eq.${user.id},addressee_id.eq.${user.id}`)
     .order("responded_at", { ascending: false });
 
   if (error) throw error;
@@ -187,9 +173,7 @@ export async function getFriends(): Promise<FriendProfile[]> {
 
   return requests
     .map((request) =>
-      request.requester_id === user.id
-        ? request.addressee
-        : request.requester,
+      request.requester_id === user.id ? request.addressee : request.requester,
     )
     .filter((profile): profile is FriendProfile => profile !== null);
 }
@@ -234,7 +218,11 @@ export async function subscribeToFriendRequests(
   const user = await requireUser();
 
   const channel = supabase
-    .channel(`friend-requests-${user.id}`)
+    .channel(
+      `friend-requests-${user.id}-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 8)}`,
+    )
     .on(
       "postgres_changes",
       {
@@ -254,12 +242,13 @@ export async function subscribeToFriendRequests(
         filter: `addressee_id=eq.${user.id}`,
       },
       onChange,
-    )
-    .subscribe((status, err) => {
-      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-        console.error("Friend request subscription:", status, err);
-      }
-    });
+    );
+
+  channel.subscribe((status, err) => {
+    if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+      console.error("Friend request subscription:", status, err);
+    }
+  });
 
   return () => {
     void supabase.removeChannel(channel);

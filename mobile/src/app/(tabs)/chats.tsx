@@ -110,6 +110,7 @@ export default function ChatsScreen() {
   const [recipientLastReadAt, setRecipientLastReadAt] = useState<string | null>(
     null,
   );
+  const [otherUserTyping, setOtherUserTyping] = useState(false);
   const [userSearchError, setUserSearchError] = useState<string | null>(null);
 
   const [messagesByChat, setMessagesByChat] = useState<
@@ -128,6 +129,11 @@ export default function ChatsScreen() {
     type: "image" | "video";
   } | null>(null);
   const snapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(
+    null,
+  );
+  const isLocallyTypingRef = useRef(false);
 
   const subscriptionGeneration = useRef(0);
   const searchGeneration = useRef(0);
@@ -166,31 +172,39 @@ export default function ChatsScreen() {
 
     void loadRecipientReadState();
 
-    const channel = supabase
-      .channel(`chat-read-receipt-${conversationId}-${currentUserId}`)
-      .on(
-        "postgres_changes",
-        {
-          event: "UPDATE",
-          schema: "public",
-          table: "conversation_members",
-          filter: `conversation_id=eq.${conversationId}`,
-        },
-        (payload) => {
-          const membership = payload.new as {
-            user_id?: string;
-            last_read_at?: string | null;
-          };
-          if (membership.user_id === otherUserId && active) {
-            setRecipientLastReadAt(membership.last_read_at ?? null);
-          }
-        },
-      )
-      .subscribe((status) => {
-        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
-          console.warn("Read receipt realtime subscription status:", status);
+    // Give every effect instance its own topic to avoid overlapping
+    // subscriptions when the selected conversation changes or remounts.
+    const channelTopic = `chat-read-receipt-${conversationId}-${currentUserId}-${Date.now()}`;
+
+    const channel = supabase.channel(channelTopic);
+
+    // Register all callbacks before subscribing.
+    channel.on(
+      "postgres_changes",
+      {
+        event: "UPDATE",
+        schema: "public",
+        table: "conversation_members",
+        filter: `conversation_id=eq.${conversationId}`,
+      },
+      (payload) => {
+        const membership = payload.new as {
+          user_id?: string;
+          last_read_at?: string | null;
+        };
+
+        if (membership.user_id === otherUserId && active) {
+          setRecipientLastReadAt(membership.last_read_at ?? null);
         }
-      });
+      },
+    );
+
+    // Subscribe only after callback registration is complete.
+    channel.subscribe((status, err) => {
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        console.warn("Read receipt Realtime subscription:", status, err);
+      }
+    });
 
     return () => {
       active = false;
@@ -198,9 +212,127 @@ export default function ChatsScreen() {
     };
   }, [selectedChat?.id, selectedChat?.otherUserId, currentUserId]);
 
+  // Presence-based typing indicators avoid a database write for every keystroke.
+  useEffect(() => {
+    const conversationId = selectedChat?.id;
+    const otherUserId = selectedChat?.otherUserId;
+
+    setOtherUserTyping(false);
+    isLocallyTypingRef.current = false;
+    if (!conversationId || !otherUserId || !currentUserId) return;
+
+    let active = true;
+    const channel = supabase.channel(`chat-typing-${conversationId}`, {
+      config: { presence: { key: currentUserId } },
+    });
+    typingChannelRef.current = channel;
+
+    const refreshTypingFromPresence = () => {
+      if (!active) return;
+      const presence = channel.presenceState() as Record<
+        string,
+        Array<{ user_id?: string; typing?: boolean; updated_at?: string }>
+      >;
+      const entries = Object.values(presence).flat();
+      const now = Date.now();
+      // Ignore stale presence records if a client disconnects without a clean leave.
+      setOtherUserTyping(
+        entries.some((entry) => {
+          if (entry.user_id !== otherUserId || entry.typing !== true)
+            return false;
+          const updatedAt = entry.updated_at
+            ? new Date(entry.updated_at).getTime()
+            : now;
+          return now - updatedAt < 4500;
+        }),
+      );
+    };
+
+    channel
+      .on("presence", { event: "sync" }, refreshTypingFromPresence)
+      .on("presence", { event: "join" }, refreshTypingFromPresence)
+      .on("presence", { event: "leave" }, refreshTypingFromPresence)
+      .subscribe((status, err) => {
+        if (status === "SUBSCRIBED") {
+          console.log("Chat list Realtime connected.");
+          return;
+        }
+
+        if (
+          status === "CHANNEL_ERROR" ||
+          status === "TIMED_OUT" ||
+          status === "CLOSED"
+        ) {
+          console.error("Chat list Realtime subscription failed:", {
+            status,
+            error: err?.message ?? err ?? "No additional error details",
+          });
+        }
+      });
+
+    return () => {
+      active = false;
+      if (typingTimerRef.current) {
+        clearTimeout(typingTimerRef.current);
+        typingTimerRef.current = null;
+      }
+      if (typingChannelRef.current === channel) typingChannelRef.current = null;
+      void channel.untrack();
+      void supabase.removeChannel(channel);
+    };
+  }, [selectedChat?.id, selectedChat?.otherUserId, currentUserId]);
+
+  const publishTypingStatus = useCallback(
+    async (typing: boolean) => {
+      const channel = typingChannelRef.current;
+      if (!channel || !currentUserId || isLocallyTypingRef.current === typing)
+        return;
+      // Update the ref before awaiting Presence so rapid keystrokes cannot queue
+      // multiple out-of-order track() calls.
+      isLocallyTypingRef.current = typing;
+      try {
+        await channel.track({
+          user_id: currentUserId,
+          typing,
+          updated_at: new Date().toISOString(),
+        });
+      } catch (error) {
+        isLocallyTypingRef.current = false;
+        console.warn("Unable to update typing status:", error);
+      }
+    },
+    [currentUserId],
+  );
+
+  const handleDraftChange = useCallback(
+    (value: string) => {
+      setDraft(value);
+      const isTyping = value.trim().length > 0;
+
+      if (typingTimerRef.current) {
+        clearTimeout(typingTimerRef.current);
+        typingTimerRef.current = null;
+      }
+
+      if (isTyping) {
+        void publishTypingStatus(true);
+        // Keep the indicator alive while the user continues typing, then clear it
+        // after a short idle period.
+        typingTimerRef.current = setTimeout(() => {
+          void publishTypingStatus(false);
+          typingTimerRef.current = null;
+        }, 2500);
+      } else {
+        void publishTypingStatus(false);
+      }
+    },
+    [publishTypingStatus],
+  );
+
   useEffect(() => {
     return () => {
       if (snapTimerRef.current) clearTimeout(snapTimerRef.current);
+      if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
     };
   }, []);
 
@@ -482,21 +614,41 @@ export default function ChatsScreen() {
   }, [currentUserId, loadConversations]);
 
   // Refresh main chat-list ticks when another participant opens a conversation.
+  // Refresh main chat-list read receipts.
   useEffect(() => {
     if (!currentUserId) return;
 
+    let active = true;
+
     const channel = supabase
-      .channel(`chat-list-read-receipts-${currentUserId}`)
+      .channel(
+        `chat-list-read-receipts-${currentUserId}-${Date.now()}-${Math.random()
+          .toString(36)
+          .slice(2, 8)}`,
+      )
       .on(
         "postgres_changes",
-        { event: "UPDATE", schema: "public", table: "conversation_members" },
-        () => {
-          void loadConversations();
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "conversation_members",
         },
-      )
-      .subscribe();
+        () => {
+          if (active) {
+            void loadConversations();
+          }
+        },
+      );
+
+    // Register callbacks before subscribing.
+    channel.subscribe((status) => {
+      if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+        console.warn("Chat-list read receipt subscription:", status);
+      }
+    });
 
     return () => {
+      active = false;
       void supabase.removeChannel(channel);
     };
   }, [currentUserId, loadConversations]);
@@ -675,7 +827,9 @@ export default function ChatsScreen() {
     if (!currentUserId) return;
 
     const channel = supabase
-      .channel(`chat-list-messages-${currentUserId}`)
+      .channel(
+        `chat-list-messages-${currentUserId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      )
       .on(
         "postgres_changes",
         {
@@ -743,7 +897,7 @@ export default function ChatsScreen() {
           return;
         }
 
-        await loadConversations();
+        void loadConversations();
       } catch (error) {
         if (active) {
           setMessageError(
@@ -889,6 +1043,11 @@ export default function ChatsScreen() {
 
       setSending(true);
       setMessageError(null);
+      if (typingTimerRef.current) {
+        clearTimeout(typingTimerRef.current);
+        typingTimerRef.current = null;
+      }
+      void publishTypingStatus(false);
 
       try {
         const savedMessage = await sendTextMessage(selectedChat.id, text);
@@ -897,8 +1056,8 @@ export default function ChatsScreen() {
 
         setDraft("");
 
-        // Refresh the conversation list and latest-message previews.
-        await loadConversations();
+        // Refresh previews in the background; don't hold the composer on list queries.
+        void loadConversations();
       } catch (error) {
         setMessageError(
           error instanceof Error ? error.message : "Please try again.",
@@ -1015,7 +1174,7 @@ export default function ChatsScreen() {
             );
             snapTimerRef.current = null;
           },
-          type === "video" ? 150_000 : 20_000,
+          type === "video" ? 125_000 : 10_000,
         );
       } catch (error) {
         const messageText =
@@ -1071,8 +1230,17 @@ export default function ChatsScreen() {
           <View style={styles.conversationUser}>
             <Text style={styles.conversationName}>{selectedChat.name}</Text>
 
-            <Text style={styles.conversationStatus}>
-              {selectedChat.online ? "Online" : selectedChat.username}
+            <Text
+              style={[
+                styles.conversationStatus,
+                otherUserTyping && styles.typingStatus,
+              ]}
+            >
+              {otherUserTyping
+                ? "Typing…"
+                : selectedChat.online
+                  ? "Online"
+                  : selectedChat.username}
             </Text>
           </View>
         </View>
@@ -1288,7 +1456,7 @@ export default function ChatsScreen() {
             placeholder="Message..."
             placeholderTextColor="#85858F"
             value={draft}
-            onChangeText={setDraft}
+            onChangeText={handleDraftChange}
             multiline
             maxLength={2000}
           />
@@ -1824,6 +1992,11 @@ const styles = StyleSheet.create({
     marginTop: 4,
   },
 
+  typingStatus: {
+    color: "#A7A0FF",
+    fontWeight: "700",
+  },
+
   messagesArea: {
     flex: 1,
   },
@@ -2028,7 +2201,7 @@ const styles = StyleSheet.create({
   },
 
   snapStatusText: {
-    color: "#f0f0f5",
+    color: "#A7A0FF",
     fontSize: 14,
     fontWeight: "700",
     paddingVertical: 8,

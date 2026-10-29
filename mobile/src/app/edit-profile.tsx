@@ -191,14 +191,15 @@ export default function EditProfileScreen() {
       }
 
       // Save profile information.
-      const { error: updateError } = await supabase
-        .from("profiles")
-        .update({
+      const { error: updateError } = await supabase.from("profiles").upsert(
+        {
+          id: userId,
           display_name: cleanName,
           username: cleanUsername,
           avatar_url: finalAvatarUrl,
-        })
-        .eq("id", userId);
+        },
+        { onConflict: "id" },
+      );
 
       if (updateError) throw updateError;
 

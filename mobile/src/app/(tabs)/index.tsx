@@ -1,4 +1,5 @@
 import React from "react";
+import NotificationBell from "@/components/notification-bell";
 import { router } from "expo-router";
 import { supabase } from "@/lib/supabase";
 import { useState } from "react";
@@ -91,71 +92,7 @@ export default function HomeScreen() {
               elevation: 3,
             }}
           >
-            <TouchableOpacity
-              onPress={handleLogout}
-              disabled={loggingOut}
-              activeOpacity={0.6}
-              accessibilityRole="button"
-              accessibilityLabel="Log out"
-              style={[
-                {
-                  width: 44,
-                  height: 44,
-                  borderRadius: 22,
-                  backgroundColor: "#F3E8FF",
-                  alignItems: "center",
-                  justifyContent: "center",
-                  zIndex: 100,
-                  elevation: 3,
-                },
-                Platform.OS === "web" ? ({ cursor: "pointer" } as any) : {},
-              ]}
-            >
-              {loggingOut ? (
-                <ActivityIndicator size="small" color="#7C3AED" />
-              ) : (
-                <View
-                  style={{
-                    width: 22,
-                    height: 22,
-                    alignItems: "center",
-                    justifyContent: "center",
-                  }}
-                >
-                  <View
-                    style={{
-                      position: "absolute",
-                      width: 19,
-                      height: 19,
-                      borderRadius: 10,
-                      borderWidth: 2.5,
-                      borderColor: "#7C3AED",
-                    }}
-                  />
-
-                  <View
-                    style={{
-                      position: "absolute",
-                      top: 0,
-                      width: 8,
-                      height: 5,
-                      backgroundColor: "#F3E8FF",
-                    }}
-                  />
-
-                  <View
-                    style={{
-                      position: "absolute",
-                      top: 0,
-                      width: 2.5,
-                      height: 11,
-                      borderRadius: 2,
-                      backgroundColor: "#7C3AED",
-                    }}
-                  />
-                </View>
-              )}
-            </TouchableOpacity>
+            <NotificationBell />
             <TouchableOpacity
               style={[styles.profileButton, { cursor: "pointer" } as any]}
               accessibilityRole="button"
