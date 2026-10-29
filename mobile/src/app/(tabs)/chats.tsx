@@ -57,6 +57,7 @@ type Chat = {
   unread: number;
   online: boolean;
   sentByMe?: boolean;
+  seenByRecipient?: boolean;
   otherUserId: string | null;
   lastMessageAt?: string | null;
 };
@@ -66,6 +67,7 @@ type Message = {
   text: string;
   fromMe: boolean;
   time: string;
+  createdAt: string;
   messageType: "text" | "image" | "video";
   mediaPath: string | null;
   mediaUri?: string | null;
@@ -103,7 +105,11 @@ export default function ChatsScreen() {
   const [searchResults, setSearchResults] = useState<ChatProfile[]>([]);
   const [creatingChat, setCreatingChat] = useState(false);
   const [sending, setSending] = useState(false);
+  const [sendingMedia, setSendingMedia] = useState(false);
   const [selectedChat, setSelectedChat] = useState<Chat | null>(null);
+  const [recipientLastReadAt, setRecipientLastReadAt] = useState<string | null>(
+    null,
+  );
   const [userSearchError, setUserSearchError] = useState<string | null>(null);
 
   const [messagesByChat, setMessagesByChat] = useState<
@@ -132,6 +138,65 @@ export default function ChatsScreen() {
   useEffect(() => {
     selectedChatIdRef.current = selectedChat?.id ?? null;
   }, [selectedChat?.id]);
+
+  // Track the recipient's read timestamp so the latest outgoing message can
+  // switch from Sent to Seen without requiring the conversation to be reopened.
+  useEffect(() => {
+    const conversationId = selectedChat?.id;
+    const otherUserId = selectedChat?.otherUserId;
+
+    setRecipientLastReadAt(null);
+    if (!conversationId || !otherUserId || !currentUserId) return;
+
+    let active = true;
+    const loadRecipientReadState = async () => {
+      const { data, error } = await supabase
+        .from("conversation_members")
+        .select("last_read_at")
+        .eq("conversation_id", conversationId)
+        .eq("user_id", otherUserId)
+        .maybeSingle();
+
+      if (error) {
+        console.error("Unable to load read receipt:", error);
+        return;
+      }
+      if (active) setRecipientLastReadAt(data?.last_read_at ?? null);
+    };
+
+    void loadRecipientReadState();
+
+    const channel = supabase
+      .channel(`chat-read-receipt-${conversationId}-${currentUserId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "conversation_members",
+          filter: `conversation_id=eq.${conversationId}`,
+        },
+        (payload) => {
+          const membership = payload.new as {
+            user_id?: string;
+            last_read_at?: string | null;
+          };
+          if (membership.user_id === otherUserId && active) {
+            setRecipientLastReadAt(membership.last_read_at ?? null);
+          }
+        },
+      )
+      .subscribe((status) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn("Read receipt realtime subscription status:", status);
+        }
+      });
+
+    return () => {
+      active = false;
+      void supabase.removeChannel(channel);
+    };
+  }, [selectedChat?.id, selectedChat?.otherUserId, currentUserId]);
 
   useEffect(() => {
     return () => {
@@ -193,7 +258,7 @@ export default function ChatsScreen() {
             ]}
             numberOfLines={1}
           >
-            {item.sentByMe ? "✓ " : ""}
+            {item.sentByMe ? (item.seenByRecipient ? "✓✓ " : "✓ ") : ""}
             {item.message}
           </Text>
 
@@ -229,6 +294,27 @@ export default function ChatsScreen() {
 
       const lastReadByConversation = new Map<string, string | null>(
         (memberships ?? []).map((membership) => [
+          membership.conversation_id as string,
+          (membership.last_read_at as string | null) ?? null,
+        ]),
+      );
+
+      // Read timestamps for the other participant drive double-tick status in the chat list.
+      const {
+        data: participantMemberships,
+        error: participantMembershipsError,
+      } = conversationIds.length
+        ? await supabase
+            .from("conversation_members")
+            .select("conversation_id, user_id, last_read_at")
+            .in("conversation_id", conversationIds)
+            .neq("user_id", currentUserId)
+        : { data: [], error: null };
+
+      if (participantMembershipsError) throw participantMembershipsError;
+
+      const recipientReadByConversation = new Map<string, string | null>(
+        (participantMemberships ?? []).map((membership) => [
           membership.conversation_id as string,
           (membership.last_read_at as string | null) ?? null,
         ]),
@@ -297,6 +383,14 @@ export default function ChatsScreen() {
           unread: unreadByConversation.get(conversation.id) ?? 0,
           online: false,
           sentByMe: latest?.sender_id === currentUserId,
+          seenByRecipient: Boolean(
+            latest?.sender_id === currentUserId &&
+            latest?.created_at &&
+            recipientReadByConversation.get(conversation.id) &&
+            new Date(
+              recipientReadByConversation.get(conversation.id) as string,
+            ).getTime() >= new Date(latest.created_at).getTime(),
+          ),
           otherUserId: profile?.id ?? null,
 
           // Used to sort conversations by latest activity.
@@ -387,6 +481,26 @@ export default function ChatsScreen() {
     };
   }, [currentUserId, loadConversations]);
 
+  // Refresh main chat-list ticks when another participant opens a conversation.
+  useEffect(() => {
+    if (!currentUserId) return;
+
+    const channel = supabase
+      .channel(`chat-list-read-receipts-${currentUserId}`)
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "conversation_members" },
+        () => {
+          void loadConversations();
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [currentUserId, loadConversations]);
+
   const mapMessage = useCallback(
     (message: ChatMessage): Message => ({
       id: message.id,
@@ -396,6 +510,7 @@ export default function ChatsScreen() {
         hour: "2-digit",
         minute: "2-digit",
       }),
+      createdAt: message.created_at,
       messageType: message.deleted_at ? "text" : message.message_type,
       mediaPath: message.deleted_at ? null : message.media_url,
       mediaUri: null,
@@ -757,6 +872,15 @@ export default function ChatsScreen() {
 
   if (selectedChat) {
     const messages = messagesByChat[selectedChat.id] ?? [];
+    const latestOutgoingMessage = [...messages]
+      .reverse()
+      .find((message) => message.fromMe);
+    const latestOutgoingIsSeen = Boolean(
+      latestOutgoingMessage &&
+      recipientLastReadAt &&
+      new Date(recipientLastReadAt).getTime() >=
+        new Date(latestOutgoingMessage.createdAt).getTime(),
+    );
 
     const sendMessage = async () => {
       const text = draft.trim();
@@ -815,6 +939,7 @@ export default function ChatsScreen() {
 
         const asset = result.assets[0];
         setSending(true);
+        setSendingMedia(true);
         setMessageError(null);
 
         const type = asset.type === "video" ? "video" : "image";
@@ -841,6 +966,7 @@ export default function ChatsScreen() {
         Alert.alert(snapMode ? "Snap not sent" : "Media not sent", message);
       } finally {
         setSending(false);
+        setSendingMedia(false);
       }
     };
 
@@ -1103,6 +1229,13 @@ export default function ChatsScreen() {
                   >
                     {message.time}
                   </Text>
+                  {message.fromMe &&
+                    !message.isSnap &&
+                    message.id === latestOutgoingMessage?.id && (
+                      <Text style={styles.readReceiptText}>
+                        {latestOutgoingIsSeen ? "✓✓ Seen" : "✓ Sent"}
+                      </Text>
+                    )}
                 </View>
               </View>
             ))
@@ -1113,12 +1246,15 @@ export default function ChatsScreen() {
         <View style={styles.composer}>
           <Pressable
             onPress={chooseAndSendMedia}
-            disabled={sending}
-            style={[styles.attachButton, sending && styles.sendButtonDisabled]}
+            disabled={sending || sendingMedia}
+            style={[
+              styles.attachButton,
+              sendingMedia && styles.sendButtonDisabled,
+            ]}
             accessibilityRole="button"
             accessibilityLabel="Attach photo or video"
           >
-            {sending ? (
+            {sendingMedia ? (
               <ActivityIndicator size="small" color="#A7A0FF" />
             ) : (
               <Text style={styles.attachButtonText}>＋</Text>
@@ -1819,6 +1955,14 @@ const styles = StyleSheet.create({
 
   theirMessageTime: {
     color: "#9999A5",
+  },
+
+  readReceiptText: {
+    color: "#48416F",
+    fontSize: 10,
+    fontWeight: "700",
+    marginTop: 2,
+    alignSelf: "flex-end",
   },
 
   composer: {

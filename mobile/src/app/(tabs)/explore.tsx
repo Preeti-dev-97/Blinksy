@@ -5,1784 +5,2321 @@ import React, {
   useRef,
   useState,
 } from "react";
-
 import {
-  ActivityIndicator,
-  Animated,
-  Alert,
-  Image,
-  Modal,
-  Platform,
-  Pressable,
-  SafeAreaView,
+  KeyboardAvoidingView,
   ScrollView,
-  StatusBar,
-  StyleSheet,
-  Text,
-  TextInput,
-  View,
-  RefreshControl,
+  Platform,
+  Image,
 } from "react-native";
-
 import * as ImagePicker from "expo-image-picker";
 import { VideoView, useVideoPlayer } from "expo-video";
-import { router } from "expo-router";
+import {
+  View,
+  Text,
+  TextInput,
+  StyleSheet,
+  FlatList,
+  Pressable,
+  StatusBar,
+  Alert,
+  ActivityIndicator,
+  Modal,
+} from "react-native";
+
+import { supabase } from "@/lib/supabase";
 
 import {
-  createStory,
-  deleteStory,
-  getStories,
-  getStoryViewers,
-  markStoryViewed,
-  type Story,
-  type StoryAudience,
-  type StoryMediaType,
-} from "@/lib/story-service";
+  getConversationsWithProfiles,
+  createDirectConversation,
+  getMessages,
+  sendTextMessage,
+  sendMediaMessage,
+  sendSnapMessage,
+  openSnapMessage,
+  getChatMediaUrl,
+  markConversationRead,
+  subscribeToMessages,
+  searchChatProfiles,
+  getLatestMessagesForConversations,
+  type ChatMessage,
+  type ChatProfile,
+} from "@/lib/chat-service";
 
-type StoryGroup = {
-  userId: string;
-  stories: Story[];
+type Chat = {
+  id: string;
   name: string;
   username: string;
-  avatarUrl: string | null;
-  isOwn: boolean;
-  hasUnseen: boolean;
+  message: string;
+  time: string;
+  avatar: string;
+  color: string;
+  unread: number;
+  online: boolean;
+  sentByMe?: boolean;
+  seenByRecipient?: boolean;
+  otherUserId: string | null;
+  lastMessageAt?: string | null;
 };
 
-type SelectedMedia = {
-  uri: string;
-  type: StoryMediaType;
+type Message = {
+  id: string;
+  text: string;
+  fromMe: boolean;
+  time: string;
+  createdAt: string;
+  messageType: "text" | "image" | "video";
+  mediaPath: string | null;
+  mediaUri?: string | null;
+  isSnap: boolean;
+  snapExpiresAt: string | null;
+  snapOpenedAt: string | null;
+  snapOpenedBy: string | null;
 };
 
-function getDisplayName(story: Story): string {
-  return (
-    story.profile?.display_name?.trim() ||
-    story.profile?.username ||
-    "Blinksy user"
-  );
-}
-
-function getInitials(name: string): string {
-  return name.trim().charAt(0).toUpperCase() || "?";
-}
-
-function formatTimeRemaining(expiresAt: string): string {
-  const remaining = new Date(expiresAt).getTime() - Date.now();
-
-  if (remaining <= 0) return "Expired";
-
-  const hours = Math.floor(remaining / (60 * 60 * 1000));
-
-  if (hours >= 1) return `${hours}h left`;
-
-  const minutes = Math.max(1, Math.floor(remaining / (60 * 1000)));
-
-  return `${minutes}m left`;
-}
-
-function StoryVideo({
-  uri,
-  paused,
-  onPlaybackEnd,
-  onDuration,
-}: {
-  uri: string;
-  paused: boolean;
-  onPlaybackEnd: () => void;
-  onDuration: (durationMs: number) => void;
-}) {
+function ChatVideo({ uri }: { uri: string }) {
   const player = useVideoPlayer(uri, (instance) => {
     instance.loop = false;
-    instance.muted = false;
   });
-
-  useEffect(() => {
-    const endSubscription = player.addListener("playToEnd", onPlaybackEnd);
-    const statusSubscription = player.addListener("statusChange", (event) => {
-      if (event.status === "readyToPlay") {
-        const duration = player.duration;
-        if (Number.isFinite(duration) && duration > 0) {
-          onDuration(duration * 1000);
-        }
-      }
-    });
-
-    return () => {
-      endSubscription.remove();
-      statusSubscription.remove();
-    };
-  }, [player, onPlaybackEnd, onDuration]);
-
-  useEffect(() => {
-    if (paused) {
-      player.pause();
-    } else {
-      player.play();
-    }
-
-    return () => {
-      player.pause();
-    };
-  }, [paused, player]);
 
   return (
     <VideoView
       player={player}
-      style={styles.viewerMedia}
+      style={styles.mediaVideo}
+      nativeControls
       contentFit="contain"
-      nativeControls={false}
     />
   );
 }
 
-export default function StoriesScreen() {
-  const [stories, setStories] = useState<Story[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [refreshing, setRefreshing] = useState(false);
-  const [screenError, setScreenError] = useState<string | null>(null);
+type FilterType = "All" | "Unread";
 
-  const [createModalVisible, setCreateModalVisible] = useState(false);
-  const [selectedMedia, setSelectedMedia] = useState<SelectedMedia | null>(
+export default function ChatsScreen() {
+  const [search, setSearch] = useState("");
+  const [activeFilter, setActiveFilter] = useState<FilterType>("All");
+  const [chats, setChats] = useState<Chat[]>([]);
+  const [, setLoading] = useState(true);
+  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
+  const [newChatMode, setNewChatMode] = useState(false);
+  const [userSearch, setUserSearch] = useState("");
+  const [searchResults, setSearchResults] = useState<ChatProfile[]>([]);
+  const [creatingChat, setCreatingChat] = useState(false);
+  const [sending, setSending] = useState(false);
+  const [sendingMedia, setSendingMedia] = useState(false);
+  const [selectedChat, setSelectedChat] = useState<Chat | null>(null);
+  const [recipientLastReadAt, setRecipientLastReadAt] = useState<string | null>(
     null,
   );
-  const [caption, setCaption] = useState("");
-  const [audience, setAudience] = useState<StoryAudience>("friends");
-  const [publishing, setPublishing] = useState(false);
+  const [otherUserTyping, setOtherUserTyping] = useState(false);
+  const [userSearchError, setUserSearchError] = useState<string | null>(null);
 
-  const [viewerStories, setViewerStories] = useState<Story[]>([]);
-  const [viewerIndex, setViewerIndex] = useState(0);
-  const [viewerVisible, setViewerVisible] = useState(false);
-  const [viewerPaused, setViewerPaused] = useState(false);
-  const [viewerLoading, setViewerLoading] = useState(false);
-  const [viewerError, setViewerError] = useState<string | null>(null);
-  const [currentDurationMs, setCurrentDurationMs] = useState(5000);
-  const progressAnim = useRef(new Animated.Value(0)).current;
-  const progressValue = useRef(0);
-  const longPressActive = useRef(false);
-  const advanceViewerRef = useRef<() => void>(() => {});
+  const [messagesByChat, setMessagesByChat] = useState<
+    Record<string, Message[]>
+  >({});
 
-  const [viewersVisible, setViewersVisible] = useState(false);
-  const [viewersLoading, setViewersLoading] = useState(false);
-  const [viewers, setViewers] = useState<any[]>([]);
+  const [draft, setDraft] = useState("");
+  const [loadingMessages, setLoadingMessages] = useState(false);
+  const [newChatLoading, setNewChatLoading] = useState(false);
+  const [messageError, setMessageError] = useState<string | null>(null);
+  const [snapMode, setSnapMode] = useState(false);
+  const [openingSnapId, setOpeningSnapId] = useState<string | null>(null);
+  const [activeSnap, setActiveSnap] = useState<{
+    id: string;
+    uri: string;
+    type: "image" | "video";
+  } | null>(null);
+  const snapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const typingChannelRef = useRef<ReturnType<typeof supabase.channel> | null>(
+    null,
+  );
 
-  const [currentUserId, setCurrentUserId] = useState<string | null>(null);
-
-  const viewedIds = useRef<Set<string>>(new Set());
-  const mounted = useRef(true);
-
-  const loadStories = useCallback(async (showLoader = true) => {
-    if (showLoader) setLoading(true);
-
-    setScreenError(null);
-
-    try {
-      const data = await getStories();
-
-      if (!mounted.current) return;
-
-      setStories(data);
-      viewedIds.current = new Set(
-        data.filter((story) => story.has_viewed).map((story) => story.id),
-      );
-    } catch (error) {
-      if (!mounted.current) return;
-
-      setScreenError(
-        error instanceof Error
-          ? error.message
-          : "Couldn't load stories. Please try again.",
-      );
-    } finally {
-      if (mounted.current) {
-        setLoading(false);
-        setRefreshing(false);
-      }
-    }
-  }, []);
+  const subscriptionGeneration = useRef(0);
+  const searchGeneration = useRef(0);
+  const selectedChatIdRef = useRef<string | null>(null);
+  const handledMessageIds = useRef<Set<string>>(new Set());
+  const resolvingMedia = useRef<Set<string>>(new Set());
 
   useEffect(() => {
-    mounted.current = true;
-    void loadStories();
+    selectedChatIdRef.current = selectedChat?.id ?? null;
+  }, [selectedChat?.id]);
+
+  // Track the recipient's read timestamp so the latest outgoing message can
+  // switch from Sent to Seen without requiring the conversation to be reopened.
+  useEffect(() => {
+    const conversationId = selectedChat?.id;
+    const otherUserId = selectedChat?.otherUserId;
+
+    setRecipientLastReadAt(null);
+    if (!conversationId || !otherUserId || !currentUserId) return;
+
+    let active = true;
+    const loadRecipientReadState = async () => {
+      const { data, error } = await supabase
+        .from("conversation_members")
+        .select("last_read_at")
+        .eq("conversation_id", conversationId)
+        .eq("user_id", otherUserId)
+        .maybeSingle();
+
+      if (error) {
+        console.error("Unable to load read receipt:", error);
+        return;
+      }
+      if (active) setRecipientLastReadAt(data?.last_read_at ?? null);
+    };
+
+    void loadRecipientReadState();
+
+    const channel = supabase
+      .channel(`chat-read-receipt-${conversationId}-${currentUserId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "UPDATE",
+          schema: "public",
+          table: "conversation_members",
+          filter: `conversation_id=eq.${conversationId}`,
+        },
+        (payload) => {
+          const membership = payload.new as {
+            user_id?: string;
+            last_read_at?: string | null;
+          };
+          if (membership.user_id === otherUserId && active) {
+            setRecipientLastReadAt(membership.last_read_at ?? null);
+          }
+        },
+      )
+      .subscribe((status) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn("Read receipt realtime subscription status:", status);
+        }
+      });
 
     return () => {
-      mounted.current = false;
+      active = false;
+      void supabase.removeChannel(channel);
     };
-  }, [loadStories]);
+  }, [selectedChat?.id, selectedChat?.otherUserId, currentUserId]);
 
-  const groups = useMemo(() => {
-    const grouped = new Map<string, Story[]>();
+  // Presence-based typing indicators avoid a database write for every keystroke.
+  useEffect(() => {
+    const conversationId = selectedChat?.id;
+    const otherUserId = selectedChat?.otherUserId;
 
-    for (const story of stories) {
-      const existing = grouped.get(story.user_id) ?? [];
-      existing.push(story);
-      grouped.set(story.user_id, existing);
-    }
+    setOtherUserTyping(false);
+    if (!conversationId || !otherUserId || !currentUserId) return;
 
-    const result: StoryGroup[] = Array.from(grouped.entries()).map(
-      ([userId, userStories]) => {
-        const profile = userStories[0]?.profile;
+    let active = true;
+    const channel = supabase.channel(`chat-typing-${conversationId}`, {
+      config: { presence: { key: currentUserId } },
+    });
+    typingChannelRef.current = channel;
+
+    channel
+      .on("presence", { event: "sync" }, () => {
+        if (!active) return;
+        const presence = channel.presenceState() as Record<
+          string,
+          Array<{ user_id?: string; typing?: boolean }>
+        >;
+        const entries = Object.values(presence).flat();
+        setOtherUserTyping(
+          entries.some(
+            (entry) => entry.user_id === otherUserId && entry.typing === true,
+          ),
+        );
+      })
+      .subscribe((status) => {
+        if (status === "SUBSCRIBED") {
+          void channel.track({ user_id: currentUserId, typing: false });
+        } else if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.warn(
+            "Typing indicator realtime subscription status:",
+            status,
+          );
+        }
+      });
+
+    return () => {
+      active = false;
+      if (typingTimerRef.current) {
+        clearTimeout(typingTimerRef.current);
+        typingTimerRef.current = null;
+      }
+      if (typingChannelRef.current === channel) typingChannelRef.current = null;
+      void channel.untrack();
+      void supabase.removeChannel(channel);
+    };
+  }, [selectedChat?.id, selectedChat?.otherUserId, currentUserId]);
+
+  const publishTypingStatus = useCallback(
+    async (typing: boolean) => {
+      const channel = typingChannelRef.current;
+      if (!channel || !currentUserId) return;
+      try {
+        await channel.track({
+          user_id: currentUserId,
+          typing,
+          updated_at: new Date().toISOString(),
+        });
+      } catch (error) {
+        console.warn("Unable to update typing status:", error);
+      }
+    },
+    [currentUserId],
+  );
+
+  const handleDraftChange = useCallback(
+    (value: string) => {
+      setDraft(value);
+      const isTyping = value.trim().length > 0;
+      void publishTypingStatus(isTyping);
+
+      if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+      if (isTyping) {
+        typingTimerRef.current = setTimeout(() => {
+          void publishTypingStatus(false);
+          typingTimerRef.current = null;
+        }, 1800);
+      }
+    },
+    [publishTypingStatus],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (snapTimerRef.current) clearTimeout(snapTimerRef.current);
+      if (typingTimerRef.current) clearTimeout(typingTimerRef.current);
+    };
+  }, []);
+
+  const filteredChats = useMemo(() => {
+    const query = search.trim().toLowerCase();
+
+    return chats.filter((chat) => {
+      const matchesSearch =
+        chat.name.toLowerCase().includes(query) ||
+        chat.username.toLowerCase().includes(query) ||
+        chat.message.toLowerCase().includes(query);
+
+      const matchesFilter = activeFilter === "All" || chat.unread > 0;
+
+      return matchesSearch && matchesFilter;
+    });
+  }, [chats, search, activeFilter]);
+
+  const renderChat = ({ item }: { item: Chat }) => (
+    <Pressable
+      style={({ pressed }) => [styles.chatItem, pressed && styles.pressed]}
+      onPress={() => {
+        selectedChatIdRef.current = item.id;
+        setSelectedChat(item);
+        setDraft("");
+      }}
+    >
+      <View style={styles.avatarContainer}>
+        <View style={[styles.avatar, { backgroundColor: item.color }]}>
+          <Text style={styles.avatarText}>{item.avatar}</Text>
+        </View>
+
+        {item.online && <View style={styles.onlineIndicator} />}
+      </View>
+
+      <View style={styles.chatDetails}>
+        <View style={styles.nameRow}>
+          <Text
+            style={[styles.chatName, item.unread > 0 && styles.unreadText]}
+            numberOfLines={1}
+          >
+            {item.name}
+          </Text>
+
+          <Text style={[styles.time, item.unread > 0 && styles.unreadTime]}>
+            {item.time}
+          </Text>
+        </View>
+
+        <View style={styles.messageRow}>
+          <Text
+            style={[
+              styles.lastMessage,
+              item.unread > 0 && styles.unreadMessage,
+            ]}
+            numberOfLines={1}
+          >
+            {item.sentByMe ? (item.seenByRecipient ? "✓✓ " : "✓ ") : ""}
+            {item.message}
+          </Text>
+
+          {item.unread > 0 && (
+            <View style={styles.unreadBadge}>
+              <Text style={styles.unreadBadgeText}>{item.unread}</Text>
+            </View>
+          )}
+        </View>
+      </View>
+    </Pressable>
+  );
+
+  const loadConversations = useCallback(async () => {
+    if (!currentUserId) return;
+
+    try {
+      const conversations = await getConversationsWithProfiles();
+
+      const conversationIds = conversations.map(
+        (conversation) => conversation.id,
+      );
+      const latestMessages =
+        await getLatestMessagesForConversations(conversationIds);
+
+      // Read receipts are stored per user and conversation.
+      const { data: memberships, error: membershipsError } = await supabase
+        .from("conversation_members")
+        .select("conversation_id, last_read_at")
+        .eq("user_id", currentUserId);
+
+      if (membershipsError) throw membershipsError;
+
+      const lastReadByConversation = new Map<string, string | null>(
+        (memberships ?? []).map((membership) => [
+          membership.conversation_id as string,
+          (membership.last_read_at as string | null) ?? null,
+        ]),
+      );
+
+      // Read timestamps for the other participant drive double-tick status in the chat list.
+      const {
+        data: participantMemberships,
+        error: participantMembershipsError,
+      } = conversationIds.length
+        ? await supabase
+            .from("conversation_members")
+            .select("conversation_id, user_id, last_read_at")
+            .in("conversation_id", conversationIds)
+            .neq("user_id", currentUserId)
+        : { data: [], error: null };
+
+      if (participantMembershipsError) throw participantMembershipsError;
+
+      const recipientReadByConversation = new Map<string, string | null>(
+        (participantMemberships ?? []).map((membership) => [
+          membership.conversation_id as string,
+          (membership.last_read_at as string | null) ?? null,
+        ]),
+      );
+
+      // Count incoming messages newer than this user's last-read timestamp.
+      // Run counts in parallel so each conversation's unread badge is accurate.
+      const unreadEntries = await Promise.all(
+        conversationIds.map(async (conversationId) => {
+          const lastReadAt = lastReadByConversation.get(conversationId);
+          let query = supabase
+            .from("messages")
+            .select("id", { count: "exact", head: true })
+            .eq("conversation_id", conversationId)
+            .neq("sender_id", currentUserId);
+
+          if (lastReadAt) query = query.gt("created_at", lastReadAt);
+
+          const { count, error } = await query;
+          if (error) throw error;
+          return [conversationId, count ?? 0] as const;
+        }),
+      );
+      const unreadByConversation = new Map<string, number>(unreadEntries);
+
+      const latestByConversation = new Map<string, ChatMessage>(
+        latestMessages.map(
+          (message) => [message.conversation_id, message] as const,
+        ),
+      );
+
+      const mappedChats: Chat[] = conversations.map((conversation) => {
+        const profile = conversation.otherUser;
 
         const name =
-          profile?.display_name?.trim() ||
-          profile?.username?.trim() ||
+          profile?.display_name ||
+          profile?.username ||
+          conversation.title ||
           "Blinksy User";
 
+        const latest = latestByConversation.get(conversation.id);
+
         return {
-          userId,
-          stories: userStories,
+          id: conversation.id,
           name,
-          username: profile?.username?.trim() || "",
-          avatarUrl: profile?.avatar_url || null,
-          isOwn: userId === currentUserId,
-          hasUnseen:
-            userId !== currentUserId &&
-            userStories.some((story) => !story.has_viewed),
+          username: profile?.username ? `@${profile.username}` : "",
+          message: latest
+            ? latest.deleted_at
+              ? "Message deleted"
+              : latest.is_snap
+                ? "◉ Snap"
+                : latest.message_type === "image"
+                  ? "📷 Photo"
+                  : latest.message_type === "video"
+                    ? "🎥 Video"
+                    : (latest.content ?? "")
+            : "Start a conversation",
+          time: latest
+            ? new Date(latest.created_at).toLocaleTimeString([], {
+                hour: "2-digit",
+                minute: "2-digit",
+              })
+            : "",
+          avatar: name.charAt(0).toUpperCase(),
+          color: "#C7A4FF",
+          unread: unreadByConversation.get(conversation.id) ?? 0,
+          online: false,
+          sentByMe: latest?.sender_id === currentUserId,
+          seenByRecipient: Boolean(
+            latest?.sender_id === currentUserId &&
+            latest?.created_at &&
+            recipientReadByConversation.get(conversation.id) &&
+            new Date(
+              recipientReadByConversation.get(conversation.id) as string,
+            ).getTime() >= new Date(latest.created_at).getTime(),
+          ),
+          otherUserId: profile?.id ?? null,
+
+          // Used to sort conversations by latest activity.
+          lastMessageAt:
+            latest?.created_at ??
+            (
+              conversation as typeof conversation & {
+                last_message_at?: string | null;
+              }
+            ).last_message_at ??
+            null,
         };
-      },
-    );
+      });
 
-    return result.sort((a, b) => {
-      if (a.isOwn) return -1;
-      if (b.isOwn) return 1;
+      mappedChats.sort((a, b) => {
+        const timeA = a.lastMessageAt ? new Date(a.lastMessageAt).getTime() : 0;
 
-      if (a.hasUnseen !== b.hasUnseen) {
-        return a.hasUnseen ? -1 : 1;
-      }
+        const timeB = b.lastMessageAt ? new Date(b.lastMessageAt).getTime() : 0;
 
-      return 0;
-    });
-  }, [stories, currentUserId]);
+        return timeB - timeA;
+      });
+
+      setChats(mappedChats);
+    } catch (error) {
+      console.error("Failed to load conversations:", error);
+    }
+  }, [currentUserId]);
 
   useEffect(() => {
     let active = true;
 
-    import("@/lib/supabase").then(({ supabase }) => {
-      supabase.auth.getUser().then(({ data }) => {
+    const initialize = async () => {
+      try {
+        const { getCurrentChatUser } = await import("@/lib/chat-service");
+        const user = await getCurrentChatUser();
+
         if (active) {
-          setCurrentUserId(data.user?.id ?? null);
+          setCurrentUserId(user.id);
         }
-      });
-    });
+      } catch (error) {
+        if (active) {
+          Alert.alert(
+            "Chats",
+            error instanceof Error
+              ? error.message
+              : "Unable to initialize Chats.",
+          );
+          setLoading(false);
+        }
+      }
+    };
+
+    void initialize();
 
     return () => {
       active = false;
     };
   }, []);
 
-  const ownStories = useMemo(
-    () => stories.filter((story) => story.user_id === currentUserId),
-    [stories, currentUserId],
-  );
-
-  const chooseMedia = async () => {
-    try {
-      const permission =
-        await ImagePicker.requestMediaLibraryPermissionsAsync();
-
-      if (!permission.granted) {
-        Alert.alert(
-          "Photo access needed",
-          "Allow photo library access so you can choose a photo or video for your story.",
-        );
-        return;
-      }
-
-      const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ["images", "videos"],
-        allowsEditing: false,
-        quality: 0.85,
-        videoMaxDuration: 60,
-      });
-
-      if (result.canceled || !result.assets[0]?.uri) return;
-
-      const asset = result.assets[0];
-
-      setSelectedMedia({
-        uri: asset.uri,
-        type: asset.type === "video" ? "video" : "image",
-      });
-
-      setCaption("");
-      setAudience("friends");
-      setCreateModalVisible(true);
-    } catch (error) {
-      Alert.alert(
-        "Couldn't open gallery",
-        error instanceof Error ? error.message : "Please try again.",
-      );
-    }
-  };
-
-  const publishStory = async () => {
-    if (!selectedMedia) {
-      Alert.alert("Choose media", "Select a photo or video first.");
-      return;
-    }
-
-    setPublishing(true);
-
-    try {
-      await createStory({
-        uri: selectedMedia.uri,
-        mediaType: selectedMedia.type,
-        caption,
-        audience,
-      });
-
-      setCreateModalVisible(false);
-      setSelectedMedia(null);
-      setCaption("");
-
-      await loadStories(false);
-
-      Alert.alert("Story shared!", "Your story is now on Blinksy.");
-    } catch (error) {
-      Alert.alert(
-        "Couldn't publish story",
-        error instanceof Error ? error.message : "Please try again.",
-      );
-    } finally {
-      setPublishing(false);
-    }
-  };
-
-  const openStoryGroup = async (group: StoryGroup) => {
-    const activeStories = group.stories.filter(
-      (story) => new Date(story.expires_at).getTime() > Date.now(),
-    );
-
-    if (activeStories.length === 0) {
-      await loadStories(false);
-      return;
-    }
-
-    const firstUnseen = activeStories.findIndex(
-      (story) => !story.has_viewed && !group.isOwn,
-    );
-
-    const initialIndex = firstUnseen >= 0 ? firstUnseen : 0;
-
-    setViewerStories(activeStories);
-    setViewerIndex(initialIndex);
-    setViewerError(null);
-    setViewerPaused(false);
-    progressValue.current = 0;
-    progressAnim.setValue(0);
-    setCurrentDurationMs(
-      activeStories[initialIndex]?.media_type === "video" ? 15000 : 5000,
-    );
-    setViewerVisible(true);
-
-    if (!group.isOwn) {
-      void recordView(activeStories[initialIndex]);
-    }
-  };
-
-  const recordView = async (story: Story) => {
-    if (story.user_id === currentUserId || viewedIds.current.has(story.id)) {
-      return;
-    }
-
-    viewedIds.current.add(story.id);
-
-    setStories((previous) =>
-      previous.map((item) =>
-        item.id === story.id ? { ...item, has_viewed: true } : item,
-      ),
-    );
-
-    try {
-      await markStoryViewed(story.id);
-    } catch (error) {
-      viewedIds.current.delete(story.id);
-
-      console.warn("Could not record story view:", error);
-    }
-  };
-
-  const moveViewer = async (direction: 1 | -1) => {
-    const nextIndex = viewerIndex + direction;
-
-    if (nextIndex < 0) {
-      setViewerVisible(false);
-      return;
-    }
-
-    if (nextIndex >= viewerStories.length) {
-      const currentOwnerId = viewerStories[viewerIndex]?.user_id;
-      const friendGroups = groups.filter((group) => !group.isOwn);
-      const currentGroupIndex = friendGroups.findIndex(
-        (group) => group.userId === currentOwnerId,
-      );
-      const nextGroups =
-        currentGroupIndex < 0
-          ? friendGroups
-          : friendGroups.slice(currentGroupIndex + 1);
-
-      const nextGroup = nextGroups.find((group) =>
-        group.stories.some(
-          (story) => new Date(story.expires_at).getTime() > Date.now(),
-        ),
-      );
-
-      if (!nextGroup) {
-        setViewerVisible(false);
-        return;
-      }
-
-      const activeNextStories = nextGroup.stories.filter(
-        (story) => new Date(story.expires_at).getTime() > Date.now(),
-      );
-      const unseenIndex = activeNextStories.findIndex(
-        (story) => !story.has_viewed,
-      );
-      const nextGroupIndex = unseenIndex >= 0 ? unseenIndex : 0;
-      const nextGroupStory = activeNextStories[nextGroupIndex];
-
-      setViewerStories(activeNextStories);
-      setViewerError(null);
-      progressValue.current = 0;
-      progressAnim.setValue(0);
-      setCurrentDurationMs(
-        nextGroupStory?.media_type === "video" ? 15000 : 5000,
-      );
-      setViewerIndex(nextGroupIndex);
-      setViewerPaused(false);
-
-      if (nextGroupStory) {
-        void recordView(nextGroupStory);
-      }
-      return;
-    }
-
-    setViewerError(null);
-    progressValue.current = 0;
-    progressAnim.setValue(0);
-    setCurrentDurationMs(
-      viewerStories[nextIndex]?.media_type === "video" ? 15000 : 5000,
-    );
-    setViewerIndex(nextIndex);
-    setViewerPaused(false);
-
-    const nextStory = viewerStories[nextIndex];
-
-    if (nextStory.user_id !== currentUserId) {
-      void recordView(nextStory);
-    }
-  };
-
-  const showViewers = async (story: Story) => {
-    setViewersVisible(true);
-    setViewersLoading(true);
-    setViewers([]);
-
-    try {
-      const data = await getStoryViewers(story.id);
-
-      setViewers(data);
-    } catch (error) {
-      Alert.alert(
-        "Couldn't load viewers",
-        error instanceof Error ? error.message : "Please try again.",
-      );
-      setViewersVisible(false);
-    } finally {
-      setViewersLoading(false);
-    }
-  };
-
-  const removeStory = (story: Story) => {
-    Alert.alert(
-      "Delete story?",
-      "This story will be removed for everyone who can see it.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Delete",
-          style: "destructive",
-          onPress: async () => {
-            try {
-              await deleteStory(story);
-
-              setViewerVisible(false);
-              setViewerStories([]);
-              setStories((previous) =>
-                previous.filter((item) => item.id !== story.id),
-              );
-
-              Alert.alert("Story deleted", "Your story has been removed.");
-            } catch (error) {
-              Alert.alert(
-                "Couldn't delete story",
-                error instanceof Error ? error.message : "Please try again.",
-              );
-            }
-          },
-        },
-      ],
-    );
-  };
-
-  const currentStory = viewerStories[viewerIndex] ?? null;
-  const isOwnCurrentStory = currentStory?.user_id === currentUserId;
-
-  advanceViewerRef.current = () => {
-    void moveViewer(1);
-  };
-
-  const handleVideoEnded = useCallback(() => {
-    advanceViewerRef.current();
-  }, []);
-
-  const handleVideoDuration = useCallback((durationMs: number) => {
-    setCurrentDurationMs(durationMs);
-  }, []);
-
   useEffect(() => {
-    if (!viewerVisible || !currentStory) return;
+    if (!currentUserId) return;
 
-    if (viewerPaused) {
-      progressAnim.stopAnimation((value) => {
-        progressValue.current = value;
-      });
-      return;
-    }
+    let active = true;
 
-    const startValue = progressValue.current;
-    const remainingMs = Math.max(1, currentDurationMs * (1 - startValue));
-    const animation = Animated.timing(progressAnim, {
-      toValue: 1,
-      duration: remainingMs,
-      useNativeDriver: false,
-    });
-    const listenerId = progressAnim.addListener(({ value }) => {
-      progressValue.current = value;
-    });
+    const load = async () => {
+      setLoading(true);
 
-    animation.start(({ finished }) => {
-      if (finished && currentStory.media_type === "image") {
-        advanceViewerRef.current();
+      try {
+        await loadConversations();
+      } catch (error) {
+        if (active) {
+          Alert.alert(
+            "Chats",
+            error instanceof Error
+              ? error.message
+              : "Unable to load conversations.",
+          );
+        }
+      } finally {
+        if (active) setLoading(false);
       }
-    });
+    };
+
+    void load();
 
     return () => {
-      animation.stop();
-      progressAnim.removeListener(listenerId);
-      progressAnim.stopAnimation((value) => {
-        progressValue.current = value;
+      active = false;
+    };
+  }, [currentUserId, loadConversations]);
+
+  // Refresh main chat-list ticks when another participant opens a conversation.
+  useEffect(() => {
+    if (!currentUserId) return;
+
+    const channel = supabase
+      .channel(`chat-list-read-receipts-${currentUserId}`)
+      .on(
+        "postgres_changes",
+        { event: "UPDATE", schema: "public", table: "conversation_members" },
+        () => {
+          void loadConversations();
+        },
+      )
+      .subscribe();
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [currentUserId, loadConversations]);
+
+  const mapMessage = useCallback(
+    (message: ChatMessage): Message => ({
+      id: message.id,
+      text: message.deleted_at ? "Message deleted" : (message.content ?? ""),
+      fromMe: message.sender_id === currentUserId,
+      time: new Date(message.created_at).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      }),
+      createdAt: message.created_at,
+      messageType: message.deleted_at ? "text" : message.message_type,
+      mediaPath: message.deleted_at ? null : message.media_url,
+      mediaUri: null,
+      isSnap: !message.deleted_at && Boolean(message.is_snap),
+      snapExpiresAt: message.snap_expires_at ?? null,
+      snapOpenedAt: message.snap_opened_at ?? null,
+      snapOpenedBy: message.snap_opened_by ?? null,
+    }),
+    [currentUserId],
+  );
+
+  const addMessage = useCallback(
+    (conversationId: string, incoming: ChatMessage) => {
+      // The list-level and open-thread subscriptions can receive the same event.
+      // Handle each message ID only once so previews and unread counts don't double.
+      if (handledMessageIds.current.has(incoming.id)) {
+        const updated = mapMessage(incoming);
+        setMessagesByChat((previous) => {
+          const existing = previous[conversationId] ?? [];
+          return {
+            ...previous,
+            [conversationId]: existing.map((message) =>
+              message.id === updated.id
+                ? { ...message, ...updated, mediaUri: message.mediaUri }
+                : message,
+            ),
+          };
+        });
+        return;
+      }
+      handledMessageIds.current.add(incoming.id);
+
+      const isIncoming = incoming.sender_id !== currentUserId;
+      const isOpenConversation = selectedChatIdRef.current === conversationId;
+
+      // Incoming messages in the currently open thread are immediately marked read.
+      if (isIncoming && isOpenConversation) {
+        void markConversationRead(conversationId).catch((error) => {
+          console.error("Failed to mark incoming message as read:", error);
+        });
+      }
+
+      const mapped = mapMessage(incoming);
+
+      // Add the message without duplicating realtime events.
+      setMessagesByChat((previous) => {
+        const existing = previous[conversationId] ?? [];
+
+        if (existing.some((message) => message.id === mapped.id)) {
+          return previous;
+        }
+
+        return {
+          ...previous,
+          [conversationId]: [...existing, mapped],
+        };
       });
+
+      // Update the preview, timestamp, and conversation order.
+      setChats((previous) => {
+        const chatIndex = previous.findIndex(
+          (chat) => chat.id === conversationId,
+        );
+
+        if (chatIndex === -1) {
+          return previous;
+        }
+
+        const existingChat = previous[chatIndex];
+
+        const updatedChat: Chat = {
+          ...existingChat,
+          message: incoming.deleted_at
+            ? "Message deleted"
+            : incoming.is_snap
+              ? "◉ Snap"
+              : incoming.message_type === "image"
+                ? "📷 Photo"
+                : incoming.message_type === "video"
+                  ? "🎥 Video"
+                  : (incoming.content ?? ""),
+          time: new Date(incoming.created_at).toLocaleTimeString([], {
+            hour: "2-digit",
+            minute: "2-digit",
+          }),
+          lastMessageAt: incoming.created_at,
+          sentByMe: incoming.sender_id === currentUserId,
+          unread: isIncoming
+            ? isOpenConversation
+              ? 0
+              : existingChat.unread + 1
+            : existingChat.unread,
+        };
+
+        return [
+          updatedChat,
+          ...previous.filter((chat) => chat.id !== conversationId),
+        ].sort((a, b) => {
+          const timeA = a.lastMessageAt
+            ? new Date(a.lastMessageAt).getTime()
+            : 0;
+          const timeB = b.lastMessageAt
+            ? new Date(b.lastMessageAt).getTime()
+            : 0;
+
+          return timeB - timeA;
+        });
+      });
+    },
+    [currentUserId, mapMessage],
+  );
+
+  // Resolve private Storage paths to temporary URLs for image/video rendering.
+  useEffect(() => {
+    const pending: Array<{
+      conversationId: string;
+      messageId: string;
+      path: string;
+    }> = [];
+    for (const [conversationId, messages] of Object.entries(messagesByChat)) {
+      for (const message of messages) {
+        if (
+          message.mediaPath &&
+          !message.isSnap &&
+          !message.mediaUri &&
+          !resolvingMedia.current.has(message.id)
+        ) {
+          resolvingMedia.current.add(message.id);
+          pending.push({
+            conversationId,
+            messageId: message.id,
+            path: message.mediaPath,
+          });
+        }
+      }
+    }
+
+    for (const item of pending) {
+      void getChatMediaUrl(item.path)
+        .then((uri) => {
+          setMessagesByChat((previous) => ({
+            ...previous,
+            [item.conversationId]: (previous[item.conversationId] ?? []).map(
+              (message) =>
+                message.id === item.messageId
+                  ? { ...message, mediaUri: uri }
+                  : message,
+            ),
+          }));
+        })
+        .catch((error) => {
+          console.error("Unable to load chat media:", error);
+        })
+        .finally(() => resolvingMedia.current.delete(item.messageId));
+    }
+  }, [messagesByChat]);
+
+  // Keep the main conversation list live even when no chat is open.
+  // The per-conversation subscription below is for the open message thread;
+  // this subscription updates the list preview and latest-activity ordering.
+  useEffect(() => {
+    if (!currentUserId) return;
+
+    const channel = supabase
+      .channel(`chat-list-messages-${currentUserId}`)
+      .on(
+        "postgres_changes",
+        {
+          event: "INSERT",
+          schema: "public",
+          table: "messages",
+        },
+        (payload) => {
+          const incoming = payload.new as ChatMessage;
+          if (!incoming?.conversation_id || !incoming?.created_at) return;
+          addMessage(incoming.conversation_id, incoming);
+        },
+      )
+      .subscribe((status) => {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
+          console.error("Chat list realtime subscription status:", status);
+        }
+      });
+
+    return () => {
+      void supabase.removeChannel(channel);
+    };
+  }, [currentUserId, addMessage]);
+
+  useEffect(() => {
+    if (!selectedChat || !currentUserId) return;
+
+    const conversationId = selectedChat.id;
+    const generation = ++subscriptionGeneration.current;
+
+    let active = true;
+    let unsubscribe: (() => void) | undefined;
+
+    setLoadingMessages(true);
+    setMessageError(null);
+
+    const initializeConversation = async () => {
+      try {
+        const history = await getMessages(conversationId, 100);
+
+        if (!active || generation !== subscriptionGeneration.current) return;
+
+        for (const message of history) {
+          handledMessageIds.current.add(message.id);
+        }
+
+        setMessagesByChat((previous) => ({
+          ...previous,
+          [conversationId]: history.map(mapMessage),
+        }));
+
+        await markConversationRead(conversationId);
+
+        if (!active || generation !== subscriptionGeneration.current) return;
+
+        // Subscribe after history has loaded.
+        unsubscribe = await subscribeToMessages(conversationId, (incoming) => {
+          if (!active || generation !== subscriptionGeneration.current) return;
+
+          addMessage(conversationId, incoming);
+        });
+
+        if (!active || generation !== subscriptionGeneration.current) {
+          unsubscribe();
+          return;
+        }
+
+        await loadConversations();
+      } catch (error) {
+        if (active) {
+          setMessageError(
+            error instanceof Error
+              ? error.message
+              : "Unable to load conversation messages.",
+          );
+        }
+      } finally {
+        if (active) setLoadingMessages(false);
+      }
+    };
+
+    void initializeConversation();
+
+    return () => {
+      active = false;
+      unsubscribe?.();
+
+      if (subscriptionGeneration.current === generation) {
+        subscriptionGeneration.current++;
+      }
     };
   }, [
-    viewerVisible,
-    viewerPaused,
-    currentStory?.id,
-    currentStory?.media_type,
-    currentDurationMs,
-    progressAnim,
+    selectedChat?.id,
+    currentUserId,
+    mapMessage,
+    addMessage,
+    loadConversations,
   ]);
 
-  return (
-    <SafeAreaView style={styles.safeArea}>
-      <StatusBar barStyle="dark-content" />
+  useEffect(() => {
+    if (!newChatMode) return;
 
-      <ScrollView
-        style={{ flex: 1 }}
-        contentContainerStyle={{
-          flexGrow: 1,
-          paddingHorizontal: 20,
-          paddingTop: 12,
-          paddingBottom: 24,
-        }}
-        showsVerticalScrollIndicator={false}
-        refreshControl={
-          <RefreshControl refreshing={refreshing} onRefresh={loadStories} />
+    const query = userSearch.trim();
+    const generation = ++searchGeneration.current;
+
+    if (!query) {
+      setSearchResults([]);
+      setNewChatLoading(false);
+      return;
+    }
+
+    const timer = setTimeout(async () => {
+      setNewChatLoading(true);
+
+      try {
+        const results = await searchChatProfiles(query);
+
+        if (generation !== searchGeneration.current) return;
+
+        setSearchResults(
+          results.filter((profile) => profile.id !== currentUserId),
+        );
+      } catch (error) {
+        if (generation === searchGeneration.current) {
+          setUserSearchError(
+            error instanceof Error ? error.message : "Search failed.",
+          );
         }
-        onScrollBeginDrag={() => {}}
+      } finally {
+        if (generation === searchGeneration.current) {
+          setNewChatLoading(false);
+        }
+      }
+    }, 300);
+
+    return () => clearTimeout(timer);
+  }, [newChatMode, userSearch, currentUserId]);
+
+  const startDirectConversation = async (profile: ChatProfile) => {
+    if (creatingChat) return;
+
+    setCreatingChat(true);
+
+    try {
+      const conversationId = await createDirectConversation(profile.id);
+
+      await loadConversations();
+
+      const existing = chats.find((chat) => chat.id === conversationId);
+
+      const name = profile.display_name || profile.username || "Blinksy User";
+
+      const chat: Chat = existing ?? {
+        id: conversationId,
+        name,
+        username: profile.username ? `@${profile.username}` : "",
+        message: "Start a conversation",
+        time: "",
+        avatar: name.charAt(0).toUpperCase(),
+        color: "#C7A4FF",
+        unread: 0,
+        online: false,
+        otherUserId: profile.id,
+        lastMessageAt: null,
+      };
+
+      setChats((previous) =>
+        previous.some((item) => item.id === conversationId)
+          ? previous
+          : [chat, ...previous],
+      );
+
+      setMessagesByChat((previous) => ({
+        ...previous,
+        [conversationId]: previous[conversationId] ?? [],
+      }));
+
+      selectedChatIdRef.current = chat.id;
+      setSelectedChat(chat);
+      setNewChatMode(false);
+      setUserSearch("");
+      setSearchResults([]);
+    } catch (error) {
+      Alert.alert(
+        "New conversation",
+        error instanceof Error
+          ? error.message
+          : "Unable to start the conversation.",
+      );
+    } finally {
+      setCreatingChat(false);
+    }
+  };
+
+  if (selectedChat) {
+    const messages = messagesByChat[selectedChat.id] ?? [];
+    const latestOutgoingMessage = [...messages]
+      .reverse()
+      .find((message) => message.fromMe);
+    const latestOutgoingIsSeen = Boolean(
+      latestOutgoingMessage &&
+      recipientLastReadAt &&
+      new Date(recipientLastReadAt).getTime() >=
+        new Date(latestOutgoingMessage.createdAt).getTime(),
+    );
+
+    const sendMessage = async () => {
+      const text = draft.trim();
+
+      if (!text || sending || !selectedChat) return;
+
+      setSending(true);
+      setMessageError(null);
+      if (typingTimerRef.current) {
+        clearTimeout(typingTimerRef.current);
+        typingTimerRef.current = null;
+      }
+      void publishTypingStatus(false);
+
+      try {
+        const savedMessage = await sendTextMessage(selectedChat.id, text);
+
+        addMessage(selectedChat.id, savedMessage);
+
+        setDraft("");
+
+        // Refresh the conversation list and latest-message previews.
+        await loadConversations();
+      } catch (error) {
+        setMessageError(
+          error instanceof Error ? error.message : "Please try again.",
+        );
+
+        Alert.alert(
+          "Message not sent",
+          error instanceof Error ? error.message : "Please try again.",
+        );
+      } finally {
+        setSending(false);
+      }
+    };
+
+    const chooseAndSendMedia = async () => {
+      if (sending || !selectedChat) return;
+
+      try {
+        const permission =
+          await ImagePicker.requestMediaLibraryPermissionsAsync();
+        if (!permission.granted) {
+          Alert.alert(
+            "Gallery permission needed",
+            "Allow Blinksy to access your photos and videos to share them in chat.",
+          );
+          return;
+        }
+
+        const result = await ImagePicker.launchImageLibraryAsync({
+          mediaTypes: ["images", "videos"],
+          allowsEditing: false,
+          allowsMultipleSelection: false,
+          quality: 0.8,
+          videoMaxDuration: 120,
+        });
+
+        if (result.canceled || !result.assets?.length) return;
+
+        const asset = result.assets[0];
+        setSending(true);
+        setSendingMedia(true);
+        setMessageError(null);
+
+        const type = asset.type === "video" ? "video" : "image";
+        const mediaAsset = {
+          uri: asset.uri,
+          type,
+          mimeType: asset.mimeType,
+          fileName: asset.fileName,
+          fileSize: asset.fileSize,
+        };
+
+        const savedMessage = snapMode
+          ? await sendSnapMessage(selectedChat.id, mediaAsset, type, draft)
+          : await sendMediaMessage(selectedChat.id, mediaAsset, type, draft);
+
+        addMessage(selectedChat.id, savedMessage);
+        setDraft("");
+        if (snapMode) setSnapMode(false);
+        await loadConversations();
+      } catch (error) {
+        const message =
+          error instanceof Error ? error.message : "Please try again.";
+        setMessageError(message);
+        Alert.alert(snapMode ? "Snap not sent" : "Media not sent", message);
+      } finally {
+        setSending(false);
+        setSendingMedia(false);
+      }
+    };
+
+    const handleOpenSnap = async (message: Message) => {
+      if (
+        !message.isSnap ||
+        message.fromMe ||
+        message.snapOpenedAt ||
+        (message.snapExpiresAt &&
+          new Date(message.snapExpiresAt).getTime() <= Date.now()) ||
+        openingSnapId
+      ) {
+        return;
+      }
+
+      setOpeningSnapId(message.id);
+      setMessageError(null);
+
+      try {
+        const opened = await openSnapMessage(message.id);
+
+        setMessagesByChat((previous) => ({
+          ...previous,
+          [selectedChat.id]: (previous[selectedChat.id] ?? []).map((item) =>
+            item.id === message.id
+              ? {
+                  ...item,
+                  snapOpenedAt:
+                    opened.message.snap_opened_at ?? new Date().toISOString(),
+                  snapOpenedBy: opened.message.snap_opened_by ?? currentUserId,
+                }
+              : item,
+          ),
+        }));
+
+        const type =
+          opened.message.message_type === "video" ? "video" : "image";
+        setActiveSnap({ id: message.id, uri: opened.mediaUri, type });
+
+        if (snapTimerRef.current) clearTimeout(snapTimerRef.current);
+        // Photos are visible briefly; videos can play up to the picker limit.
+        snapTimerRef.current = setTimeout(
+          () => {
+            setActiveSnap((current) =>
+              current?.id === message.id ? null : current,
+            );
+            snapTimerRef.current = null;
+          },
+          type === "video" ? 125_000 : 10_000,
+        );
+      } catch (error) {
+        const messageText =
+          error instanceof Error
+            ? error.message
+            : "This Snap is no longer available.";
+        setMessageError(messageText);
+        Alert.alert("Snap unavailable", messageText);
+      } finally {
+        setOpeningSnapId(null);
+      }
+    };
+
+    const closeActiveSnap = () => {
+      if (snapTimerRef.current) {
+        clearTimeout(snapTimerRef.current);
+        snapTimerRef.current = null;
+      }
+      setActiveSnap(null);
+    };
+
+    return (
+      <KeyboardAvoidingView
+        style={styles.conversationContainer}
+        behavior={Platform.OS === "ios" ? "padding" : undefined}
       >
-        <View style={styles.header}>
-          <View>
-            <Text style={styles.logo}>blinksy</Text>
-            <Text style={styles.subtitle}>Stories</Text>
+        <StatusBar barStyle="light-content" />
+
+        {/* Conversation header */}
+        <View style={styles.conversationHeader}>
+          <Pressable
+            onPress={() => {
+              closeActiveSnap();
+              selectedChatIdRef.current = null;
+              setSelectedChat(null);
+            }}
+            style={styles.backButton}
+          >
+            <Text style={styles.backButtonText}>‹</Text>
+          </Pressable>
+
+          <View
+            style={[
+              styles.conversationAvatar,
+              { backgroundColor: selectedChat.color },
+            ]}
+          >
+            <Text style={styles.conversationAvatarText}>
+              {selectedChat.avatar}
+            </Text>
           </View>
 
-          <Pressable
-            style={styles.profileButton}
-            accessibilityRole="button"
-            accessibilityLabel="Open profile"
-            onPress={() => router.push("/edit-profile" as never)}
-          >
-            <Text style={styles.profileIcon}>👤</Text>
-          </Pressable>
+          <View style={styles.conversationUser}>
+            <Text style={styles.conversationName}>{selectedChat.name}</Text>
+
+            <Text
+              style={[
+                styles.conversationStatus,
+                otherUserTyping && styles.typingStatus,
+              ]}
+            >
+              {otherUserTyping
+                ? "Typing…"
+                : selectedChat.online
+                  ? "Online"
+                  : selectedChat.username}
+            </Text>
+          </View>
         </View>
 
-        <View style={styles.headingContainer}>
-          <View style={styles.headingRow}>
-            <View style={styles.headingCopy}>
-              <Text style={styles.heading}>Friends' stories</Text>
-              <Text style={styles.description}>
-                Little moments from the people you care about.
+        {/* Messages */}
+        <ScrollView
+          style={styles.messagesArea}
+          contentContainerStyle={styles.messagesContent}
+          keyboardShouldPersistTaps="handled"
+        >
+          {messages.length === 0 ? (
+            <View style={styles.conversationEmpty}>
+              <View
+                style={[
+                  styles.largeAvatar,
+                  { backgroundColor: selectedChat.color },
+                ]}
+              >
+                <Text style={styles.largeAvatarText}>
+                  {selectedChat.avatar}
+                </Text>
+              </View>
+
+              <Text style={styles.conversationEmptyName}>
+                {selectedChat.name}
+              </Text>
+
+              <Text style={styles.conversationEmptyText}>
+                You're connected on Blinksy. Say hello! 👋
               </Text>
             </View>
-
-            <Pressable
-              onPress={() => {
-                setRefreshing(true);
-                void loadStories(false);
-              }}
-              style={styles.refreshButton}
-              accessibilityRole="button"
-              accessibilityLabel="Refresh stories"
-            >
-              <Text style={styles.refreshText}>↻</Text>
-            </Pressable>
-          </View>
-        </View>
-
-        {loading ? (
-          <View style={styles.loadingContainer}>
-            <ActivityIndicator size="large" color="#7C3AED" />
-            <Text style={styles.loadingText}>Loading stories...</Text>
-          </View>
-        ) : screenError ? (
-          <View style={styles.errorCard}>
-            <Text style={styles.errorTitle}>Couldn't load stories</Text>
-            <Text style={styles.errorText}>{screenError}</Text>
-            <Pressable
-              style={styles.shareButton}
-              onPress={() => void loadStories()}
-            >
-              <Text style={styles.shareButtonText}>Try again</Text>
-            </Pressable>
-          </View>
-        ) : (
-          <>
-            <ScrollView
-              horizontal
-              showsHorizontalScrollIndicator={false}
-              contentContainerStyle={styles.storiesList}
-            >
-              <Pressable
-                style={styles.storyItem}
-                onPress={() => {
-                  if (ownStories.length > 0) {
-                    const ownGroup = groups.find((group) => group.isOwn);
-
-                    if (ownGroup) void openStoryGroup(ownGroup);
-                  } else {
-                    void chooseMedia();
-                  }
-                }}
-                accessibilityRole="button"
-                accessibilityLabel={
-                  ownStories.length > 0
-                    ? "View your story"
-                    : "Create your story"
-                }
+          ) : (
+            messages.map((message) => (
+              <View
+                key={message.id}
+                style={[
+                  styles.messageRowBubble,
+                  message.fromMe ? styles.myMessageRow : styles.theirMessageRow,
+                ]}
               >
                 <View
                   style={[
-                    styles.storyRing,
-                    ownStories.length === 0 && styles.ownStoryRing,
+                    styles.messageBubble,
+                    message.fromMe
+                      ? styles.myMessageBubble
+                      : styles.theirMessageBubble,
                   ]}
                 >
-                  {ownStories[0]?.profile?.avatar_url ? (
-                    <Image
-                      source={{ uri: ownStories[0].profile.avatar_url }}
-                      style={styles.storyAvatarImage}
-                    />
-                  ) : (
-                    <View style={[styles.storyAvatar, styles.ownStoryAvatar]}>
-                      <Text style={styles.ownAvatarText}>
-                        {ownStories.length > 0 ? getInitials("You") : "+"}
-                      </Text>
-                    </View>
-                  )}
-                </View>
-                <Text style={styles.storyName}>Your story</Text>
-              </Pressable>
-
-              {groups
-                .filter((group) => !group.isOwn)
-                .map((group) => (
-                  <Pressable
-                    key={group.userId}
-                    style={styles.storyItem}
-                    accessibilityRole="button"
-                    accessibilityLabel={`${group.name}'s story`}
-                    onPress={() => void openStoryGroup(group)}
-                  >
-                    <View
-                      style={[
-                        styles.storyRing,
-                        !group.hasUnseen && styles.seenStoryRing,
-                      ]}
-                    >
-                      {group.avatarUrl ? (
-                        <Image
-                          source={{ uri: group.avatarUrl }}
-                          style={styles.storyAvatarImage}
-                        />
-                      ) : (
-                        <View style={styles.storyAvatar}>
-                          <Text style={styles.avatarText}>
-                            {getInitials(group.name)}
+                  {message.isSnap ? (
+                    <View style={styles.snapCard}>
+                      {message.snapExpiresAt &&
+                      new Date(message.snapExpiresAt).getTime() <=
+                        Date.now() ? (
+                        <Text style={styles.snapStatusText}>
+                          ⌛ Snap expired
+                        </Text>
+                      ) : message.fromMe ? (
+                        <Text style={styles.snapStatusText}>
+                          {message.snapOpenedAt ? "✓ Opened" : "◉ Snap sent"}
+                        </Text>
+                      ) : message.snapOpenedAt ? (
+                        activeSnap?.id === message.id ? (
+                          <View style={styles.openSnapContent}>
+                            {activeSnap.type === "image" ? (
+                              <Image
+                                source={{ uri: activeSnap.uri }}
+                                style={styles.mediaImage}
+                                resizeMode="cover"
+                                accessibilityLabel="Opened Snap"
+                              />
+                            ) : (
+                              <ChatVideo uri={activeSnap.uri} />
+                            )}
+                            <Pressable
+                              style={styles.closeSnapButton}
+                              onPress={closeActiveSnap}
+                            >
+                              <Text style={styles.closeSnapButtonText}>
+                                Close Snap
+                              </Text>
+                            </Pressable>
+                          </View>
+                        ) : (
+                          <Text style={styles.snapStatusText}>
+                            ✓ Snap opened
                           </Text>
-                        </View>
+                        )
+                      ) : (
+                        <Pressable
+                          style={styles.openSnapButton}
+                          onPress={() => void handleOpenSnap(message)}
+                          disabled={openingSnapId !== null}
+                        >
+                          {openingSnapId === message.id ? (
+                            <ActivityIndicator color="#171522" />
+                          ) : (
+                            <>
+                              <Text style={styles.openSnapIcon}>◉</Text>
+                              <Text style={styles.openSnapButtonText}>
+                                Tap to view Snap
+                              </Text>
+                            </>
+                          )}
+                        </Pressable>
                       )}
                     </View>
-                    <Text style={styles.storyName} numberOfLines={1}>
-                      {group.name}
-                    </Text>
-                  </Pressable>
-                ))}
-            </ScrollView>
-
-            {stories.length === 0 ? (
-              <View style={styles.emptyCard}>
-                <View style={styles.emptyIcon}>
-                  <Text style={styles.emptyEmoji}>✨</Text>
-                </View>
-
-                <Text style={styles.emptyTitle}>Your story starts here</Text>
-
-                <Text style={styles.emptyDescription}>
-                  Share a photo or video with your friends. Your stories will
-                  appear here for 24 hours.
-                </Text>
-
-                <Pressable
-                  style={styles.shareButton}
-                  accessibilityRole="button"
-                  onPress={() => void chooseMedia()}
-                >
-                  <Text style={styles.shareButtonText}>Create a story</Text>
-                </Pressable>
-              </View>
-            ) : (
-              <View style={styles.activeStoriesCard}>
-                <View style={styles.activeStoriesHeader}>
-                  <View style={styles.activeStoriesIcon}>
-                    <Text style={styles.activeStoriesEmoji}>✨</Text>
-                  </View>
-                  <View style={styles.activeStoriesCopy}>
-                    <Text style={styles.activeStoriesTitle}>
-                      Moments worth sharing
-                    </Text>
-                    <Text style={styles.activeStoriesDescription}>
-                      {stories.length} active{" "}
-                      {stories.length === 1 ? "story" : "stories"} · disappear
-                      after 24 hours
-                    </Text>
-                  </View>
-                </View>
-
-                <Pressable
-                  style={styles.shareButton}
-                  accessibilityRole="button"
-                  onPress={() => void chooseMedia()}
-                >
-                  <Text style={styles.shareButtonText}>＋ Create a story</Text>
-                </Pressable>
-              </View>
-            )}
-          </>
-        )}
-
-        <Text style={styles.footerText}>
-          Your everyday moments deserve a little spotlight.
-        </Text>
-      </ScrollView>
-
-      {/* Create story */}
-      <Modal
-        visible={createModalVisible}
-        animationType="slide"
-        presentationStyle="pageSheet"
-        onRequestClose={() => {
-          if (!publishing) setCreateModalVisible(false);
-        }}
-      >
-        <SafeAreaView style={styles.modalSafeArea}>
-          <View style={styles.modalHeader}>
-            <Pressable
-              onPress={() => setCreateModalVisible(false)}
-              disabled={publishing}
-              style={styles.modalCloseButton}
-            >
-              <Text style={styles.modalCloseText}>✕</Text>
-            </Pressable>
-
-            <Text style={styles.modalTitle}>Create a story</Text>
-
-            <View style={styles.modalHeaderSpacer} />
-          </View>
-
-          <ScrollView
-            contentContainerStyle={styles.createContent}
-            keyboardShouldPersistTaps="handled"
-          >
-            {selectedMedia ? (
-              selectedMedia.type === "image" ? (
-                <Image
-                  source={{ uri: selectedMedia.uri }}
-                  style={styles.mediaPreview}
-                  resizeMode="contain"
-                />
-              ) : (
-                <PreviewVideo uri={selectedMedia.uri} />
-              )
-            ) : null}
-
-            <Text style={styles.fieldLabel}>Add a caption</Text>
-
-            <TextInput
-              value={caption}
-              onChangeText={setCaption}
-              placeholder="Write something about this moment..."
-              placeholderTextColor="#96919F"
-              style={styles.captionInput}
-              multiline
-              maxLength={300}
-            />
-
-            <Text style={styles.fieldLabel}>Who can see your story?</Text>
-
-            <Pressable
-              style={[
-                styles.audienceOption,
-                audience === "friends" && styles.audienceOptionSelected,
-              ]}
-              onPress={() => setAudience("friends")}
-            >
-              <View style={styles.audienceIcon}>
-                <Text style={styles.audienceEmoji}>👥</Text>
-              </View>
-              <View style={styles.audienceCopy}>
-                <Text style={styles.audienceTitle}>Friends</Text>
-                <Text style={styles.audienceDescription}>
-                  Only accepted friends can view it.
-                </Text>
-              </View>
-              <Text style={styles.radioText}>
-                {audience === "friends" ? "●" : "○"}
-              </Text>
-            </Pressable>
-
-            <Pressable
-              style={[
-                styles.audienceOption,
-                audience === "public" && styles.audienceOptionSelected,
-              ]}
-              onPress={() => setAudience("public")}
-            >
-              <View style={styles.audienceIcon}>
-                <Text style={styles.audienceEmoji}>🌍</Text>
-              </View>
-              <View style={styles.audienceCopy}>
-                <Text style={styles.audienceTitle}>Public</Text>
-                <Text style={styles.audienceDescription}>
-                  Any authenticated Blinksy user can view it.
-                </Text>
-              </View>
-              <Text style={styles.radioText}>
-                {audience === "public" ? "●" : "○"}
-              </Text>
-            </Pressable>
-
-            <Pressable
-              style={[styles.shareButton, publishing && styles.disabledButton]}
-              disabled={publishing || !selectedMedia}
-              onPress={() => void publishStory()}
-            >
-              {publishing ? (
-                <ActivityIndicator color="#FFFFFF" />
-              ) : (
-                <Text style={styles.shareButtonText}>Share story</Text>
-              )}
-            </Pressable>
-          </ScrollView>
-        </SafeAreaView>
-      </Modal>
-
-      {/* Full-screen story viewer */}
-      <Modal
-        visible={viewerVisible}
-        animationType="fade"
-        presentationStyle="fullScreen"
-        onRequestClose={() => setViewerVisible(false)}
-      >
-        <View style={styles.viewerContainer}>
-          <StatusBar hidden />
-
-          {currentStory ? (
-            <>
-              <View style={styles.progressTrack}>
-                {viewerStories.map((story, index) => (
-                  <View key={story.id} style={styles.progressSegment}>
-                    <View
-                      style={[
-                        styles.progressFill,
-                        index < viewerIndex && styles.progressComplete,
-                        index === viewerIndex && styles.progressCurrent,
-                      ]}
-                    >
-                      {index === viewerIndex ? (
-                        <Animated.View
-                          style={[
-                            styles.animatedProgressFill,
-                            {
-                              width: progressAnim.interpolate({
-                                inputRange: [0, 1],
-                                outputRange: ["0%", "100%"],
-                              }),
-                            },
-                          ]}
-                        />
-                      ) : null}
-                    </View>
-                  </View>
-                ))}
-              </View>
-
-              <View style={styles.viewerHeader}>
-                <View style={styles.viewerProfile}>
-                  {currentStory.profile?.avatar_url ? (
+                  ) : message.messageType === "image" && message.mediaUri ? (
                     <Image
-                      source={{ uri: currentStory.profile.avatar_url }}
-                      style={styles.viewerAvatar}
+                      source={{ uri: message.mediaUri }}
+                      style={styles.mediaImage}
+                      resizeMode="cover"
+                      accessibilityLabel="Shared photo"
                     />
-                  ) : (
-                    <View style={styles.viewerAvatarFallback}>
-                      <Text style={styles.viewerAvatarText}>
-                        {getInitials(getDisplayName(currentStory))}
+                  ) : message.messageType === "video" && message.mediaUri ? (
+                    <ChatVideo uri={message.mediaUri} />
+                  ) : message.messageType !== "text" && message.mediaPath ? (
+                    <View style={styles.mediaLoading}>
+                      <ActivityIndicator
+                        color={message.fromMe ? "#171522" : "#A7A0FF"}
+                      />
+                      <Text
+                        style={[
+                          styles.mediaLoadingText,
+                          message.fromMe
+                            ? styles.myMessageText
+                            : styles.theirMessageText,
+                        ]}
+                      >
+                        Loading media…
                       </Text>
                     </View>
-                  )}
-
-                  <View style={styles.viewerProfileCopy}>
-                    <Text style={styles.viewerName}>
-                      {getDisplayName(currentStory)}
-                    </Text>
-                    <Text style={styles.viewerTime}>
-                      {formatTimeRemaining(currentStory.expires_at)}
-                      {" · "}
-                      {currentStory.audience === "public"
-                        ? "Public"
-                        : "Friends"}
-                    </Text>
-                  </View>
-                </View>
-
-                <View style={styles.viewerActions}>
-                  {isOwnCurrentStory ? (
-                    <>
-                      <Pressable
-                        style={styles.viewerAction}
-                        onPress={() => void showViewers(currentStory)}
-                        accessibilityLabel="View story viewers"
-                      >
-                        <Text style={styles.viewerActionText}>👁</Text>
-                      </Pressable>
-
-                      <Pressable
-                        style={styles.viewerAction}
-                        onPress={() => removeStory(currentStory)}
-                        accessibilityLabel="Delete story"
-                      >
-                        <Text style={styles.viewerActionText}>🗑</Text>
-                      </Pressable>
-                    </>
                   ) : null}
 
-                  <Pressable
-                    style={styles.viewerAction}
-                    onPress={() => setViewerVisible(false)}
-                    accessibilityLabel="Close story"
+                  {!!message.text && (
+                    <Text
+                      style={[
+                        styles.messageText,
+                        message.fromMe
+                          ? styles.myMessageText
+                          : styles.theirMessageText,
+                      ]}
+                    >
+                      {message.text}
+                    </Text>
+                  )}
+
+                  <Text
+                    style={[
+                      styles.messageTime,
+                      message.fromMe
+                        ? styles.myMessageTime
+                        : styles.theirMessageTime,
+                    ]}
                   >
-                    <Text style={styles.viewerActionText}>✕</Text>
-                  </Pressable>
+                    {message.time}
+                  </Text>
+                  {message.fromMe &&
+                    !message.isSnap &&
+                    message.id === latestOutgoingMessage?.id && (
+                      <Text style={styles.readReceiptText}>
+                        {latestOutgoingIsSeen ? "✓✓ Seen" : "✓ Sent"}
+                      </Text>
+                    )}
                 </View>
               </View>
-
-              <View style={styles.viewerMediaContainer}>
-                {currentStory.media_type === "image" ? (
-                  <Image
-                    source={{ uri: currentStory.media_url }}
-                    style={styles.viewerMedia}
-                    resizeMode="contain"
-                    onError={() => setViewerError("Couldn't load this photo.")}
-                  />
-                ) : (
-                  <StoryVideo
-                    key={currentStory.id}
-                    uri={currentStory.media_url}
-                    paused={viewerPaused}
-                    onPlaybackEnd={handleVideoEnded}
-                    onDuration={handleVideoDuration}
-                  />
-                )}
-
-                {viewerError ? (
-                  <View style={styles.viewerErrorOverlay}>
-                    <Text style={styles.viewerErrorText}>{viewerError}</Text>
-                  </View>
-                ) : null}
-
-                <Pressable
-                  style={styles.viewerLeftTap}
-                  delayLongPress={250}
-                  onPressIn={() => {
-                    longPressActive.current = false;
-                  }}
-                  onLongPress={() => {
-                    longPressActive.current = true;
-                    setViewerPaused(true);
-                  }}
-                  onPress={() => {
-                    if (longPressActive.current) return;
-                    void moveViewer(-1);
-                  }}
-                  onPressOut={() => setViewerPaused(false)}
-                  accessibilityLabel="Previous story"
-                />
-
-                <Pressable
-                  style={styles.viewerRightTap}
-                  delayLongPress={250}
-                  onPressIn={() => {
-                    longPressActive.current = false;
-                  }}
-                  onLongPress={() => {
-                    longPressActive.current = true;
-                    setViewerPaused(true);
-                  }}
-                  onPress={() => {
-                    if (longPressActive.current) return;
-                    void moveViewer(1);
-                  }}
-                  onPressOut={() => setViewerPaused(false)}
-                  accessibilityLabel="Next story"
-                />
-              </View>
-
-              <View style={styles.viewerBottom}>
-                {!!currentStory.caption && (
-                  <Text style={styles.viewerCaption}>
-                    {currentStory.caption}
-                  </Text>
-                )}
-
-                <Text style={styles.viewerHint}>
-                  Tap left or right to navigate · Hold to pause
-                </Text>
-              </View>
-            </>
-          ) : (
-            <ActivityIndicator color="#FFFFFF" />
+            ))
           )}
-        </View>
-      </Modal>
+        </ScrollView>
 
-      {/* Story viewers */}
-      <Modal
-        visible={viewersVisible}
-        transparent
-        animationType="slide"
-        onRequestClose={() => setViewersVisible(false)}
-      >
-        <View style={styles.sheetBackdrop}>
+        {/* Message composer */}
+        <View style={styles.composer}>
           <Pressable
-            style={StyleSheet.absoluteFill}
-            onPress={() => setViewersVisible(false)}
+            onPress={chooseAndSendMedia}
+            disabled={sending || sendingMedia}
+            style={[
+              styles.attachButton,
+              sendingMedia && styles.sendButtonDisabled,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel="Attach photo or video"
+          >
+            {sendingMedia ? (
+              <ActivityIndicator size="small" color="#A7A0FF" />
+            ) : (
+              <Text style={styles.attachButtonText}>＋</Text>
+            )}
+          </Pressable>
+
+          <Pressable
+            onPress={() => setSnapMode((enabled) => !enabled)}
+            disabled={sending}
+            style={[
+              styles.snapModeButton,
+              snapMode && styles.snapModeButtonActive,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel={
+              snapMode ? "Send as regular media" : "Send as disappearing Snap"
+            }
+          >
+            <Text
+              style={[
+                styles.snapModeButtonText,
+                snapMode && styles.snapModeButtonTextActive,
+              ]}
+            >
+              {snapMode ? "SNAP ✓" : "SNAP"}
+            </Text>
+          </Pressable>
+
+          <TextInput
+            style={styles.messageInput}
+            placeholder="Message..."
+            placeholderTextColor="#85858F"
+            value={draft}
+            onChangeText={handleDraftChange}
+            multiline
+            maxLength={2000}
           />
 
-          <View style={styles.viewersSheet}>
-            <View style={styles.sheetHandle} />
+          <Pressable
+            onPress={sendMessage}
+            disabled={!draft.trim() || sending}
+            style={[
+              styles.sendButton,
+              !draft.trim() && styles.sendButtonDisabled,
+            ]}
+          >
+            <Text style={styles.sendButtonText}>➤</Text>
+          </Pressable>
+        </View>
+      </KeyboardAvoidingView>
+    );
+  }
 
-            <View style={styles.viewersHeadingRow}>
-              <Text style={styles.viewersTitle}>Story viewers</Text>
-              <Pressable onPress={() => setViewersVisible(false)}>
-                <Text style={styles.sheetClose}>✕</Text>
+  return (
+    <View style={styles.container}>
+      <StatusBar barStyle="light-content" />
+
+      {/* Header */}
+      <View style={styles.header}>
+        <View>
+          <Text style={styles.eyebrow}>STAY CONNECTED</Text>
+          <Text style={styles.title}>Chats</Text>
+        </View>
+
+        <Pressable
+          style={styles.newChatButton}
+          onPress={() => {
+            setNewChatMode(true);
+            setUserSearch("");
+            setSearchResults([]);
+            setUserSearchError(null);
+          }}
+        >
+          <Text style={styles.newChatIcon}>＋</Text>
+        </Pressable>
+      </View>
+
+      {/* Search */}
+      <View style={styles.searchContainer}>
+        <Text style={styles.searchIcon}>⌕</Text>
+
+        <TextInput
+          style={styles.searchInput}
+          placeholder="Search friends or messages"
+          placeholderTextColor="#777780"
+          value={search}
+          onChangeText={setSearch}
+          autoCapitalize="none"
+          clearButtonMode="while-editing"
+        />
+      </View>
+
+      {/* Filters */}
+      <View style={styles.filterRow}>
+        {(["All", "Unread"] as FilterType[]).map((filter) => {
+          const selected = activeFilter === filter;
+
+          return (
+            <Pressable
+              key={filter}
+              onPress={() => setActiveFilter(filter)}
+              style={[
+                styles.filterButton,
+                selected && styles.activeFilterButton,
+              ]}
+            >
+              <Text
+                style={[styles.filterText, selected && styles.activeFilterText]}
+              >
+                {filter}
+              </Text>
+
+              {filter === "Unread" && (
+                <View style={styles.filterCount}>
+                  <Text style={styles.filterCountText}>
+                    {chats.filter((chat) => chat.unread > 0).length}
+                  </Text>
+                </View>
+              )}
+            </Pressable>
+          );
+        })}
+      </View>
+
+      {/* Conversations */}
+      <FlatList
+        data={filteredChats}
+        keyExtractor={(item) => item.id}
+        renderItem={renderChat}
+        showsVerticalScrollIndicator={false}
+        contentContainerStyle={styles.listContent}
+        ListHeaderComponent={<Text style={styles.sectionTitle}>MESSAGES</Text>}
+        ListEmptyComponent={
+          <View style={styles.emptyContainer}>
+            <Text style={styles.emptyIcon}>💬</Text>
+
+            <Text style={styles.emptyTitle}>No conversations found</Text>
+
+            <Text style={styles.emptyDescription}>
+              Try another search or check back later.
+            </Text>
+          </View>
+        }
+      />
+      <Modal
+        visible={newChatMode}
+        animationType="slide"
+        transparent
+        onRequestClose={() => {
+          setNewChatMode(false);
+          setUserSearch("");
+          setSearchResults([]);
+          setUserSearchError(null);
+        }}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.newChatModal}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>New Chat</Text>
+
+              <Pressable
+                onPress={() => {
+                  setNewChatMode(false);
+                  setUserSearch("");
+                  setSearchResults([]);
+                  setUserSearchError(null);
+                }}
+                style={styles.modalCloseButton}
+              >
+                <Text style={styles.modalCloseText}>✕</Text>
               </Pressable>
             </View>
 
-            {viewersLoading ? (
+            <TextInput
+              style={styles.userSearchInput}
+              placeholder="Search by username or name"
+              placeholderTextColor="#777780"
+              value={userSearch}
+              onChangeText={(text) => {
+                setUserSearch(text);
+                setUserSearchError(null);
+              }}
+              autoCapitalize="none"
+              autoCorrect={false}
+              autoFocus
+            />
+
+            {newChatLoading && (
               <ActivityIndicator
-                size="large"
-                color="#7C3AED"
-                style={styles.viewersLoader}
+                size="small"
+                color="#A7A0FF"
+                style={styles.searchLoader}
               />
-            ) : viewers.length === 0 ? (
-              <Text style={styles.noViewersText}>
-                No one has viewed this story yet.
-              </Text>
-            ) : (
-              <ScrollView>
-                {viewers.map((item) => {
-                  const profile = Array.isArray(item.profile)
-                    ? item.profile[0]
-                    : item.profile;
-
-                  const name =
-                    profile?.display_name ||
-                    profile?.username ||
-                    "Blinksy user";
-
-                  return (
-                    <View key={item.viewer_id} style={styles.viewerRow}>
-                      {profile?.avatar_url ? (
-                        <Image
-                          source={{ uri: profile.avatar_url }}
-                          style={styles.viewerListAvatar}
-                        />
-                      ) : (
-                        <View style={styles.viewerListAvatarFallback}>
-                          <Text style={styles.avatarText}>
-                            {getInitials(name)}
-                          </Text>
-                        </View>
-                      )}
-
-                      <View style={styles.viewerListCopy}>
-                        <Text style={styles.viewerListName}>{name}</Text>
-                        <Text style={styles.viewerListTime}>
-                          {new Date(item.viewed_at).toLocaleString()}
-                        </Text>
-                      </View>
-                    </View>
-                  );
-                })}
-              </ScrollView>
             )}
+
+            {userSearchError && (
+              <Text style={styles.userSearchError}>{userSearchError}</Text>
+            )}
+
+            {!newChatLoading &&
+              !userSearchError &&
+              userSearch.trim().length > 0 &&
+              searchResults.length === 0 && (
+                <Text style={styles.noUsersText}>
+                  No users found. Try another name or username.
+                </Text>
+              )}
+
+            <FlatList
+              data={searchResults}
+              keyExtractor={(item) => item.id}
+              keyboardShouldPersistTaps="handled"
+              renderItem={({ item }) => {
+                const name =
+                  item.display_name || item.username || "Blinksy User";
+
+                return (
+                  <Pressable
+                    style={styles.userResult}
+                    disabled={creatingChat}
+                    onPress={() => {
+                      void startDirectConversation(item);
+                    }}
+                  >
+                    <View style={styles.userResultAvatar}>
+                      <Text style={styles.userResultAvatarText}>
+                        {name.charAt(0).toUpperCase()}
+                      </Text>
+                    </View>
+
+                    <View style={styles.userResultDetails}>
+                      <Text style={styles.userResultName}>{name}</Text>
+
+                      <Text style={styles.userResultUsername}>
+                        @{item.username}
+                      </Text>
+                    </View>
+
+                    {creatingChat ? (
+                      <ActivityIndicator size="small" color="#A7A0FF" />
+                    ) : (
+                      <Text style={styles.startChatIcon}>›</Text>
+                    )}
+                  </Pressable>
+                );
+              }}
+            />
+
+            <Text style={styles.searchHint}>
+              Search for someone on Blinksy to start a conversation.
+            </Text>
           </View>
         </View>
       </Modal>
-    </SafeAreaView>
-  );
-}
-
-function PreviewVideo({ uri }: { uri: string }) {
-  const player = useVideoPlayer(uri, (instance) => {
-    instance.loop = true;
-    instance.muted = true;
-  });
-
-  useEffect(() => {
-    player.play();
-
-    return () => {
-      player.pause();
-    };
-  }, [player]);
-
-  return (
-    <VideoView
-      player={player}
-      style={styles.mediaPreview}
-      contentFit="contain"
-      nativeControls
-    />
+    </View>
   );
 }
 
 const styles = StyleSheet.create({
-  safeArea: {
-    flex: 1,
-    backgroundColor: "#FFFFFF",
-  },
-  scrollView: {
-    flex: 1,
-  },
   container: {
-    flexGrow: 1,
-    paddingHorizontal: 22,
-    paddingTop: 16,
-    paddingBottom: 32,
+    flex: 1,
+    width: "100%",
+    backgroundColor: "#101014",
+    paddingTop: 12,
+    paddingBottom: 0,
+    overflow: "hidden",
   },
   header: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
+    paddingHorizontal: 22,
+    paddingTop: 12,
+    paddingBottom: 22,
+    width: "100%",
   },
-  logo: {
-    color: "#171717",
+  eyebrow: {
+    color: "#A7A0FF",
+    fontSize: 10,
+    fontWeight: "800",
+    letterSpacing: 2,
+    marginBottom: 6,
+  },
+  title: {
+    color: "#FFFFFF",
     fontSize: 32,
-    fontWeight: "900",
-    letterSpacing: -1.5,
+    fontWeight: "800",
   },
-  subtitle: {
-    color: "#858585",
-    fontSize: 12,
-    marginTop: 2,
-  },
-  profileButton: {
-    height: 46,
+  newChatButton: {
     width: 46,
-    borderRadius: 23,
-    backgroundColor: "#F4F1FF",
+    height: 46,
+    borderRadius: 16,
+    backgroundColor: "#A7A0FF",
     alignItems: "center",
     justifyContent: "center",
-    borderWidth: 1,
-    borderColor: "#E9E2FF",
   },
-  profileIcon: {
-    fontSize: 22,
+  newChatIcon: {
+    color: "#101014",
+    fontSize: 30,
+    fontWeight: "400",
+    marginTop: -3,
   },
-  headingContainer: {
-    marginTop: 32,
+  searchContainer: {
+    height: 50,
+    marginHorizontal: 22,
+    marginBottom: 20,
+    paddingHorizontal: 15,
+    borderRadius: 15,
+    backgroundColor: "#1D1D24",
+    flexDirection: "row",
+    alignItems: "center",
+  },
+  searchIcon: {
+    color: "#A7A0FF",
+    fontSize: 25,
+    marginRight: 10,
+  },
+  searchInput: {
+    flex: 1,
+    color: "#FFFFFF",
+    fontSize: 14,
+    paddingVertical: 10,
+  },
+  filterRow: {
+    flexDirection: "row",
+    paddingHorizontal: 22,
+    gap: 10,
     marginBottom: 24,
   },
-  headingRow: {
+  filterButton: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 19,
+    paddingVertical: 10,
+    borderRadius: 20,
+    backgroundColor: "#1D1D24",
+    gap: 7,
+  },
+  activeFilterButton: {
+    backgroundColor: "#A7A0FF",
+  },
+  filterText: {
+    color: "#B8B8C2",
+    fontSize: 13,
+    fontWeight: "600",
+  },
+  activeFilterText: {
+    color: "#101014",
+  },
+  filterCount: {
+    backgroundColor: "#101014",
+    borderRadius: 10,
+    minWidth: 20,
+    height: 20,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  filterCountText: {
+    color: "#FFFFFF",
+    fontSize: 10,
+    fontWeight: "700",
+  },
+  listContent: {
+    paddingBottom: 24,
+    flexGrow: 1,
+  },
+  sectionTitle: {
+    color: "#777780",
+    fontSize: 10,
+    fontWeight: "800",
+    letterSpacing: 1.8,
+    marginHorizontal: 23,
+    marginBottom: 8,
+  },
+  chatItem: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 22,
+    paddingVertical: 15,
+  },
+  pressed: {
+    opacity: 0.7,
+  },
+  avatarContainer: {
+    position: "relative",
+    marginRight: 14,
+  },
+  avatar: {
+    width: 54,
+    height: 54,
+    borderRadius: 19,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+  avatarText: {
+    color: "#191921",
+    fontSize: 22,
+    fontWeight: "800",
+  },
+  onlineIndicator: {
+    position: "absolute",
+    right: -1,
+    bottom: -1,
+    width: 15,
+    height: 15,
+    borderRadius: 8,
+    backgroundColor: "#55E6A5",
+    borderWidth: 3,
+    borderColor: "#101014",
+  },
+  chatDetails: {
+    flex: 1,
+    justifyContent: "center",
+    borderBottomWidth: 1,
+    borderBottomColor: "#24242B",
+    paddingBottom: 15,
+    minHeight: 54,
+  },
+  nameRow: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    gap: 12,
+    marginBottom: 7,
+    gap: 8,
   },
-  headingCopy: {
+  chatName: {
+    color: "#E4E4EB",
+    fontSize: 15,
+    fontWeight: "600",
     flex: 1,
   },
-  heading: {
-    color: "#171717",
-    fontSize: 24,
-    fontWeight: "800",
-    letterSpacing: -0.5,
-  },
-  description: {
-    color: "#858585",
-    fontSize: 13,
-    lineHeight: 20,
-    marginTop: 7,
-  },
-  refreshButton: {
-    width: 42,
-    height: 42,
-    borderRadius: 14,
-    backgroundColor: "#F4F1FF",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  refreshText: {
-    color: "#6D28D9",
-    fontSize: 28,
-    lineHeight: 32,
-  },
-  storiesList: {
-    paddingVertical: 8,
-    paddingRight: 8,
-  },
-  storyItem: {
-    alignItems: "center",
-    width: 76,
-    marginRight: 12,
-  },
-  storyRing: {
-    width: 68,
-    height: 68,
-    borderRadius: 34,
-    padding: 3,
-    borderWidth: 2.5,
-    borderColor: "#8B5CF6",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  seenStoryRing: {
-    borderColor: "#D8D5DF",
-  },
-  ownStoryRing: {
-    borderColor: "#D8D5DF",
-  },
-  storyAvatar: {
-    width: 54,
-    height: 54,
-    borderRadius: 27,
-    backgroundColor: "#E8DEFF",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  ownStoryAvatar: {
-    backgroundColor: "#F5F3F8",
-  },
-  storyAvatarImage: {
-    width: 54,
-    height: 54,
-    borderRadius: 27,
-  },
-  avatarText: {
-    color: "#49347B",
-    fontSize: 20,
-    fontWeight: "800",
-  },
-  ownAvatarText: {
-    color: "#6D28D9",
-    fontSize: 27,
-    fontWeight: "500",
-  },
-  storyName: {
-    color: "#424047",
-    fontSize: 11,
-    marginTop: 8,
-    fontWeight: "600",
-    maxWidth: 76,
-  },
-  loadingContainer: {
-    paddingVertical: 42,
-    alignItems: "center",
-    gap: 12,
-  },
-  loadingText: {
-    color: "#85818E",
-    fontSize: 13,
-  },
-  errorCard: {
-    backgroundColor: "#FFF5F5",
-    borderRadius: 22,
-    padding: 22,
-    alignItems: "center",
-    marginTop: 20,
-  },
-  errorTitle: {
-    color: "#991B1B",
-    fontSize: 17,
-    fontWeight: "800",
-  },
-  errorText: {
-    color: "#7F1D1D",
-    textAlign: "center",
-    lineHeight: 20,
-    marginTop: 8,
-  },
-  emptyCard: {
-    backgroundColor: "#F8F6FC",
-    borderRadius: 28,
-    borderWidth: 1,
-    borderColor: "#EEE8F7",
-    alignItems: "center",
-    paddingHorizontal: 24,
-    paddingVertical: 36,
-    marginTop: 34,
-  },
-  emptyIcon: {
-    width: 66,
-    height: 66,
-    borderRadius: 22,
-    backgroundColor: "#FFF0BF",
-    alignItems: "center",
-    justifyContent: "center",
-    marginBottom: 20,
-  },
-  emptyEmoji: {
-    fontSize: 30,
-  },
-  emptyTitle: {
-    color: "#211A36",
-    fontSize: 21,
-    fontWeight: "800",
-    textAlign: "center",
-  },
-  emptyDescription: {
-    color: "#77727F",
-    fontSize: 13,
-    lineHeight: 21,
-    textAlign: "center",
-    marginTop: 10,
-  },
-  shareButton: {
-    backgroundColor: "#211A36",
-    paddingHorizontal: 24,
-    paddingVertical: 14,
-    borderRadius: 16,
-    marginTop: 22,
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  shareButtonText: {
+  unreadText: {
     color: "#FFFFFF",
-    fontSize: 13,
+    fontWeight: "800",
+  },
+  time: {
+    color: "#777780",
+    fontSize: 11,
+  },
+  unreadTime: {
+    color: "#A7A0FF",
     fontWeight: "700",
   },
-  activeStoriesCard: {
-    backgroundColor: "#F8F6FC",
-    borderRadius: 26,
-    borderWidth: 1,
-    borderColor: "#EEE8F7",
-    padding: 20,
-    marginTop: 30,
-  },
-  activeStoriesHeader: {
+  messageRow: {
     flexDirection: "row",
     alignItems: "center",
-    gap: 13,
+    justifyContent: "space-between",
+    gap: 8,
   },
-  activeStoriesIcon: {
-    width: 50,
-    height: 50,
-    borderRadius: 17,
-    backgroundColor: "#FFF0BF",
+  lastMessage: {
+    color: "#898993",
+    fontSize: 12,
+    flex: 1,
+  },
+  unreadMessage: {
+    color: "#C4C4CF",
+    fontWeight: "600",
+  },
+  unreadBadge: {
+    minWidth: 21,
+    height: 21,
+    paddingHorizontal: 5,
+    borderRadius: 11,
+    backgroundColor: "#A7A0FF",
     alignItems: "center",
     justifyContent: "center",
   },
-  activeStoriesEmoji: {
-    fontSize: 23,
-  },
-  activeStoriesCopy: {
-    flex: 1,
-  },
-  activeStoriesTitle: {
-    color: "#211A36",
-    fontSize: 16,
+  unreadBadgeText: {
+    color: "#101014",
+    fontSize: 10,
     fontWeight: "800",
   },
-  activeStoriesDescription: {
-    color: "#77727F",
-    fontSize: 12,
-    lineHeight: 18,
-    marginTop: 5,
+  emptyContainer: {
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 35,
+    paddingTop: 75,
   },
-  footerText: {
-    color: "#96919F",
-    fontSize: 11,
+  emptyIcon: {
+    fontSize: 42,
+    marginBottom: 16,
+  },
+  emptyTitle: {
+    color: "#FFFFFF",
+    fontSize: 17,
+    fontWeight: "700",
+    marginBottom: 8,
+  },
+  emptyDescription: {
+    color: "#898993",
+    fontSize: 13,
     textAlign: "center",
-    marginTop: 26,
-    lineHeight: 18,
+    lineHeight: 20,
   },
-  modalSafeArea: {
+  conversationContainer: {
     flex: 1,
-    backgroundColor: "#FFFFFF",
+    backgroundColor: "#101014",
+    width: "100%",
   },
+
+  conversationHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderBottomWidth: 1,
+    borderBottomColor: "#292930",
+    gap: 12,
+  },
+
+  backButton: {
+    width: 34,
+    height: 42,
+    justifyContent: "center",
+  },
+
+  backButtonText: {
+    color: "#FFFFFF",
+    fontSize: 38,
+    lineHeight: 42,
+  },
+
+  conversationAvatar: {
+    width: 44,
+    height: 44,
+    borderRadius: 16,
+    alignItems: "center",
+    justifyContent: "center",
+  },
+
+  conversationAvatarText: {
+    color: "#191921",
+    fontSize: 19,
+    fontWeight: "800",
+  },
+
+  conversationUser: {
+    flex: 1,
+  },
+
+  conversationName: {
+    color: "#FFFFFF",
+    fontSize: 15,
+    fontWeight: "700",
+  },
+
+  conversationStatus: {
+    color: "#55E6A5",
+    fontSize: 12,
+    marginTop: 4,
+  },
+
+  typingStatus: {
+    color: "#A7A0FF",
+    fontWeight: "700",
+  },
+
+  messagesArea: {
+    flex: 1,
+  },
+
+  messagesContent: {
+    paddingHorizontal: 16,
+    paddingVertical: 20,
+    flexGrow: 1,
+  },
+
+  conversationEmpty: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingVertical: 50,
+  },
+
+  largeAvatar: {
+    width: 76,
+    height: 76,
+    borderRadius: 27,
+    alignItems: "center",
+    justifyContent: "center",
+    marginBottom: 16,
+  },
+
+  largeAvatarText: {
+    color: "#191921",
+    fontSize: 32,
+    fontWeight: "800",
+  },
+
+  conversationEmptyName: {
+    color: "#FFFFFF",
+    fontSize: 20,
+    fontWeight: "800",
+    marginBottom: 8,
+  },
+
+  conversationEmptyText: {
+    color: "#92929D",
+    fontSize: 13,
+    textAlign: "center",
+  },
+
+  messageRowBubble: {
+    width: "100%",
+    flexDirection: "row",
+    marginBottom: 12,
+  },
+
+  myMessageRow: {
+    justifyContent: "flex-end",
+  },
+
+  theirMessageRow: {
+    justifyContent: "flex-start",
+  },
+
+  messageBubble: {
+    maxWidth: "82%",
+    minWidth: 65,
+    paddingHorizontal: 14,
+    paddingTop: 10,
+    paddingBottom: 7,
+    borderRadius: 18,
+  },
+
+  myMessageBubble: {
+    backgroundColor: "#A7A0FF",
+    borderBottomRightRadius: 5,
+  },
+
+  theirMessageBubble: {
+    backgroundColor: "#25252E",
+    borderBottomLeftRadius: 5,
+  },
+
+  mediaImage: {
+    width: 220,
+    height: 240,
+    borderRadius: 12,
+    marginBottom: 4,
+    backgroundColor: "#18181F",
+  },
+
+  mediaVideo: {
+    width: 240,
+    height: 300,
+    borderRadius: 12,
+    marginBottom: 4,
+    backgroundColor: "#000000",
+  },
+
+  mediaLoading: {
+    minWidth: 160,
+    minHeight: 90,
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 8,
+  },
+
+  mediaLoadingText: {
+    fontSize: 12,
+  },
+
+  messageText: {
+    fontSize: 14,
+    lineHeight: 21,
+  },
+
+  myMessageText: {
+    color: "#171522",
+  },
+
+  theirMessageText: {
+    color: "#FFFFFF",
+  },
+
+  messageTime: {
+    fontSize: 10,
+    marginTop: 4,
+    alignSelf: "flex-end",
+  },
+
+  myMessageTime: {
+    color: "#48416F",
+  },
+
+  theirMessageTime: {
+    color: "#9999A5",
+  },
+
+  readReceiptText: {
+    color: "#48416F",
+    fontSize: 10,
+    fontWeight: "700",
+    marginTop: 2,
+    alignSelf: "flex-end",
+  },
+
+  composer: {
+    flexDirection: "row",
+    alignItems: "flex-end",
+    paddingHorizontal: 14,
+    paddingTop: 12,
+    paddingBottom: 16,
+    borderTopWidth: 1,
+    borderTopColor: "#292930",
+    gap: 10,
+  },
+
+  attachButton: {
+    width: 42,
+    height: 46,
+    borderRadius: 23,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#25252E",
+    borderWidth: 1,
+    borderColor: "#383842",
+  },
+
+  attachButtonText: {
+    color: "#A7A0FF",
+    fontSize: 27,
+    lineHeight: 30,
+    fontWeight: "500",
+  },
+
+  snapModeButton: {
+    minWidth: 54,
+    height: 46,
+    borderRadius: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 7,
+    backgroundColor: "#25252E",
+    borderWidth: 1,
+    borderColor: "#383842",
+  },
+
+  snapModeButtonActive: {
+    backgroundColor: "#F7D84A",
+    borderColor: "#F7D84A",
+  },
+
+  snapModeButtonText: {
+    color: "#A7A0FF",
+    fontSize: 10,
+    fontWeight: "900",
+  },
+
+  snapModeButtonTextActive: {
+    color: "#171522",
+  },
+
+  snapCard: {
+    minWidth: 150,
+    minHeight: 64,
+    justifyContent: "center",
+  },
+
+  snapStatusText: {
+    color: "#A7A0FF",
+    fontSize: 14,
+    fontWeight: "700",
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+  },
+
+  openSnapButton: {
+    minWidth: 180,
+    minHeight: 72,
+    borderRadius: 16,
+    backgroundColor: "#F7D84A",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+  },
+
+  openSnapIcon: {
+    color: "#171522",
+    fontSize: 24,
+    fontWeight: "900",
+  },
+
+  openSnapButtonText: {
+    color: "#171522",
+    fontSize: 13,
+    fontWeight: "800",
+    marginTop: 3,
+  },
+
+  openSnapContent: {
+    gap: 8,
+  },
+
+  closeSnapButton: {
+    alignSelf: "flex-start",
+    backgroundColor: "#F7D84A",
+    paddingVertical: 8,
+    paddingHorizontal: 13,
+    borderRadius: 12,
+  },
+
+  closeSnapButtonText: {
+    color: "#171522",
+    fontWeight: "800",
+    fontSize: 12,
+  },
+
+  messageInput: {
+    flex: 1,
+    minHeight: 46,
+    maxHeight: 110,
+    backgroundColor: "#25252E",
+    borderRadius: 22,
+    paddingHorizontal: 17,
+    paddingTop: 13,
+    paddingBottom: 12,
+    color: "#FFFFFF",
+    fontSize: 14,
+  },
+
+  sendButton: {
+    width: 46,
+    height: 46,
+    borderRadius: 23,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: "#A7A0FF",
+  },
+
+  sendButtonDisabled: {
+    opacity: 0.4,
+  },
+
+  sendButtonText: {
+    color: "#171522",
+    fontSize: 21,
+    fontWeight: "800",
+  },
+  modalOverlay: {
+    flex: 1,
+    justifyContent: "flex-end",
+    backgroundColor: "rgba(0, 0, 0, 0.65)",
+  },
+
+  newChatModal: {
+    height: "78%",
+    backgroundColor: "#101014",
+    borderTopLeftRadius: 26,
+    borderTopRightRadius: 26,
+    paddingHorizontal: 20,
+    paddingTop: 22,
+    paddingBottom: 16,
+  },
+
   modalHeader: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: 20,
-    paddingVertical: 14,
-    borderBottomWidth: 1,
-    borderBottomColor: "#F0EDF5",
+    marginBottom: 20,
   },
+
+  modalTitle: {
+    color: "#FFFFFF",
+    fontSize: 24,
+    fontWeight: "800",
+  },
+
   modalCloseButton: {
     width: 38,
     height: 38,
     borderRadius: 13,
-    backgroundColor: "#F4F1FA",
+    backgroundColor: "#25252E",
     alignItems: "center",
     justifyContent: "center",
   },
+
   modalCloseText: {
-    color: "#211A36",
+    color: "#FFFFFF",
     fontSize: 17,
   },
-  modalTitle: {
-    color: "#211A36",
-    fontSize: 17,
-    fontWeight: "800",
-  },
-  modalHeaderSpacer: {
-    width: 38,
-  },
-  createContent: {
-    padding: 22,
-    paddingBottom: 40,
-  },
-  mediaPreview: {
-    width: "100%",
-    height: 330,
-    backgroundColor: "#171522",
-    borderRadius: 22,
-    marginBottom: 24,
-  },
-  fieldLabel: {
-    color: "#211A36",
+
+  userSearchInput: {
+    height: 50,
+    borderRadius: 15,
+    backgroundColor: "#1D1D24",
+    paddingHorizontal: 16,
+    color: "#FFFFFF",
     fontSize: 14,
-    fontWeight: "800",
-    marginBottom: 10,
-    marginTop: 8,
+    marginBottom: 14,
   },
-  captionInput: {
-    minHeight: 88,
-    borderRadius: 16,
-    borderWidth: 1,
-    borderColor: "#E9E2F3",
-    backgroundColor: "#FAF9FC",
-    paddingHorizontal: 15,
+
+  searchLoader: {
+    marginVertical: 16,
+  },
+
+  userSearchError: {
+    color: "#FF8585",
+    fontSize: 13,
+    lineHeight: 20,
+    marginBottom: 12,
+  },
+
+  noUsersText: {
+    color: "#92929D",
+    fontSize: 13,
+    textAlign: "center",
+    paddingVertical: 20,
+  },
+
+  userResult: {
+    flexDirection: "row",
+    alignItems: "center",
     paddingVertical: 13,
-    fontSize: 14,
-    color: "#211A36",
-    textAlignVertical: "top",
-    marginBottom: 22,
-  },
-  audienceOption: {
-    flexDirection: "row",
-    alignItems: "center",
-    borderWidth: 1,
-    borderColor: "#E9E2F3",
-    borderRadius: 18,
-    padding: 14,
-    marginBottom: 10,
-    gap: 12,
-  },
-  audienceOptionSelected: {
-    borderColor: "#8B5CF6",
-    backgroundColor: "#F7F3FF",
-  },
-  audienceIcon: {
-    width: 44,
-    height: 44,
-    borderRadius: 14,
-    backgroundColor: "#EEE7FF",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  audienceEmoji: {
-    fontSize: 20,
-  },
-  audienceCopy: {
-    flex: 1,
-  },
-  audienceTitle: {
-    color: "#211A36",
-    fontSize: 14,
-    fontWeight: "800",
-  },
-  audienceDescription: {
-    color: "#77727F",
-    fontSize: 12,
-    lineHeight: 17,
-    marginTop: 4,
-  },
-  radioText: {
-    color: "#7C3AED",
-    fontSize: 21,
-  },
-  disabledButton: {
-    opacity: 0.65,
-  },
-  viewerContainer: {
-    flex: 1,
-    backgroundColor: "#08070D",
-    paddingTop: Platform.OS === "ios" ? 12 : 24,
-  },
-  progressTrack: {
-    flexDirection: "row",
-    gap: 4,
-    paddingHorizontal: 10,
-    paddingTop: 8,
-  },
-  progressSegment: {
-    flex: 1,
-    height: 3,
-    backgroundColor: "rgba(255,255,255,0.3)",
-    borderRadius: 2,
-    overflow: "hidden",
-  },
-  progressFill: {
-    height: "100%",
-    width: "0%",
-    backgroundColor: "#FFFFFF",
-  },
-  progressComplete: {
-    width: "100%",
-  },
-  progressCurrent: {
-    width: "100%",
-    backgroundColor: "transparent",
-  },
-  animatedProgressFill: {
-    height: "100%",
-    backgroundColor: "#FFFFFF",
-    borderRadius: 2,
-  },
-  viewerHeader: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    paddingHorizontal: 15,
-    paddingVertical: 15,
-    gap: 8,
-  },
-  viewerProfile: {
-    flexDirection: "row",
-    alignItems: "center",
-    flex: 1,
-    gap: 10,
-  },
-  viewerAvatar: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
-  },
-  viewerAvatarFallback: {
-    width: 38,
-    height: 38,
-    borderRadius: 19,
-    backgroundColor: "#8B5CF6",
-    alignItems: "center",
-    justifyContent: "center",
-  },
-  viewerAvatarText: {
-    color: "#FFFFFF",
-    fontWeight: "800",
-  },
-  viewerProfileCopy: {
-    flex: 1,
-  },
-  viewerName: {
-    color: "#FFFFFF",
-    fontSize: 13,
-    fontWeight: "800",
-  },
-  viewerTime: {
-    color: "#BDB8C9",
-    fontSize: 11,
-    marginTop: 4,
-  },
-  viewerActions: {
-    flexDirection: "row",
-    alignItems: "center",
-    gap: 5,
-  },
-  viewerAction: {
-    width: 36,
-    height: 36,
-    borderRadius: 18,
-    alignItems: "center",
-    justifyContent: "center",
-    backgroundColor: "rgba(255,255,255,0.12)",
-  },
-  viewerActionText: {
-    color: "#FFFFFF",
-    fontSize: 16,
-  },
-  viewerMediaContainer: {
-    flex: 1,
-    justifyContent: "center",
-    position: "relative",
-  },
-  viewerMedia: {
-    width: "100%",
-    height: "100%",
-  },
-  viewerLeftTap: {
-    position: "absolute",
-    top: 0,
-    bottom: 0,
-    left: 0,
-    width: "35%",
-  },
-  viewerRightTap: {
-    position: "absolute",
-    top: 0,
-    bottom: 0,
-    right: 0,
-    width: "65%",
-  },
-  viewerErrorOverlay: {
-    position: "absolute",
-    alignSelf: "center",
-    backgroundColor: "rgba(0,0,0,0.75)",
-    borderRadius: 12,
-    padding: 14,
-  },
-  viewerErrorText: {
-    color: "#FFFFFF",
-    fontSize: 13,
-  },
-  viewerBottom: {
-    paddingHorizontal: 20,
-    paddingTop: 12,
-    paddingBottom: 24,
-    minHeight: 70,
-  },
-  viewerCaption: {
-    color: "#FFFFFF",
-    fontSize: 15,
-    lineHeight: 22,
-    marginBottom: 8,
-  },
-  viewerHint: {
-    color: "#A7A1B3",
-    fontSize: 11,
-    textAlign: "center",
-  },
-  sheetBackdrop: {
-    flex: 1,
-    justifyContent: "flex-end",
-    backgroundColor: "rgba(0,0,0,0.5)",
-  },
-  viewersSheet: {
-    backgroundColor: "#FFFFFF",
-    borderTopLeftRadius: 28,
-    borderTopRightRadius: 28,
-    paddingHorizontal: 22,
-    paddingTop: 12,
-    paddingBottom: 30,
-    maxHeight: "70%",
-    minHeight: 260,
-  },
-  sheetHandle: {
-    alignSelf: "center",
-    width: 42,
-    height: 5,
-    borderRadius: 3,
-    backgroundColor: "#DED9E8",
-    marginBottom: 20,
-  },
-  viewersHeadingRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 16,
-  },
-  viewersTitle: {
-    color: "#211A36",
-    fontSize: 20,
-    fontWeight: "800",
-  },
-  sheetClose: {
-    color: "#77727F",
-    fontSize: 18,
-    padding: 5,
-  },
-  viewersLoader: {
-    marginTop: 35,
-  },
-  noViewersText: {
-    color: "#77727F",
-    textAlign: "center",
-    paddingVertical: 35,
-    fontSize: 13,
-  },
-  viewerRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    paddingVertical: 12,
-    gap: 12,
     borderBottomWidth: 1,
-    borderBottomColor: "#F0EDF5",
+    borderBottomColor: "#24242B",
   },
-  viewerListAvatar: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-  },
-  viewerListAvatarFallback: {
-    width: 44,
-    height: 44,
-    borderRadius: 22,
-    backgroundColor: "#E8DEFF",
+
+  userResultAvatar: {
+    width: 46,
+    height: 46,
+    borderRadius: 16,
+    backgroundColor: "#C7A4FF",
     alignItems: "center",
     justifyContent: "center",
+    marginRight: 13,
   },
-  viewerListCopy: {
+
+  userResultAvatarText: {
+    color: "#191921",
+    fontSize: 20,
+    fontWeight: "800",
+  },
+
+  userResultDetails: {
     flex: 1,
   },
-  viewerListName: {
-    color: "#211A36",
+
+  userResultName: {
+    color: "#FFFFFF",
     fontSize: 14,
     fontWeight: "700",
   },
-  viewerListTime: {
-    color: "#85818E",
-    fontSize: 11,
+
+  userResultUsername: {
+    color: "#92929D",
+    fontSize: 12,
     marginTop: 4,
+  },
+
+  startChatIcon: {
+    color: "#A7A0FF",
+    fontSize: 30,
+  },
+
+  searchHint: {
+    color: "#777780",
+    fontSize: 12,
+    textAlign: "center",
+    paddingTop: 14,
   },
 });
