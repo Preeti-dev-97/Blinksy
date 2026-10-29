@@ -44,12 +44,18 @@
         {
           "photosPermission": "Allow Blinksy to access your photos.",
           "savePhotosPermission": "Allow Blinksy to save snaps to your Gallery.",
-          "granularPermissions": ["photo", "video"]
+          "granularPermissions": [
+            "photo",
+            "video"
+          ]
         }
       ],
       "expo-sharing",
       "expo-video",
-      "expo-sqlite"
+      "expo-sqlite",
+      "expo-image",
+      "expo-splash-screen",
+      "expo-web-browser"
     ],
     "experiments": {
       "typedRoutes": true,

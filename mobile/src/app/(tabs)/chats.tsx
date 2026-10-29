@@ -254,19 +254,23 @@ export default function ChatsScreen() {
       .on("presence", { event: "leave" }, refreshTypingFromPresence)
       .subscribe((status, err) => {
         if (status === "SUBSCRIBED") {
-          console.log("Chat list Realtime connected.");
+          console.log("Chat list Realtime connected");
           return;
         }
 
-        if (
-          status === "CHANNEL_ERROR" ||
-          status === "TIMED_OUT" ||
-          status === "CLOSED"
-        ) {
+        if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
           console.error("Chat list Realtime subscription failed:", {
             status,
-            error: err?.message ?? err ?? "No additional error details",
+            message: err?.message,
+            name: err?.name,
+            cause: err?.cause,
+            error: err,
           });
+          return;
+        }
+
+        if (status === "CLOSED") {
+          console.warn("Chat list Realtime channel closed");
         }
       });
 
