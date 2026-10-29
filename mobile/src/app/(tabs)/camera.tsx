@@ -9,6 +9,8 @@ import { File as ExpoFile, Paths } from "expo-file-system";
 import {
   ActivityIndicator,
   Image,
+  Modal,
+  ScrollView,
   SafeAreaView,
   StatusBar,
   StyleSheet,
@@ -25,6 +27,13 @@ import {
 } from "expo-camera";
 import { VideoView, useVideoPlayer } from "expo-video";
 import { router } from "expo-router";
+import {
+  createDirectConversation,
+  getCurrentChatUser,
+  searchChatProfiles,
+  sendSnapMessage,
+  type ChatProfile,
+} from "@/lib/chat-service";
 
 export default function CameraScreen() {
   const [permission, requestPermission] = useCameraPermissions();
@@ -43,6 +52,15 @@ export default function CameraScreen() {
     useMicrophonePermissions();
   const [recordingSeconds, setRecordingSeconds] = useState(0);
   const [cameraError, setCameraError] = useState("");
+  const [isRecipientPickerVisible, setIsRecipientPickerVisible] =
+    useState(false);
+  const [recipientSearch, setRecipientSearch] = useState("");
+  const [recipientProfiles, setRecipientProfiles] = useState<ChatProfile[]>([]);
+  const [isSearchingRecipients, setIsSearchingRecipients] = useState(false);
+  const [isSendingSnap, setIsSendingSnap] = useState(false);
+  const [sendingSnapRecipientId, setSendingSnapRecipientId] = useState<
+    string | null
+  >(null);
   const [caption, setCaption] = useState("");
   const [isEditingCaption, setIsEditingCaption] = useState(false);
   const [isDrawingMode, setIsDrawingMode] = useState(false);
@@ -124,6 +142,184 @@ export default function CameraScreen() {
 
     return () => clearInterval(timer);
   }, [isRecording]);
+
+  useEffect(() => {
+    if (!isRecipientPickerVisible) return;
+
+    let cancelled = false;
+    const timer = setTimeout(async () => {
+      try {
+        setIsSearchingRecipients(true);
+        const [profiles, currentUser] = await Promise.all([
+          searchChatProfiles(recipientSearch),
+          getCurrentChatUser(),
+        ]);
+        if (!cancelled) {
+          setRecipientProfiles(
+            profiles.filter((profile) => profile.id !== currentUser.id),
+          );
+        }
+      } catch (error) {
+        if (!cancelled) {
+          Alert.alert(
+            "Couldn't load friends",
+            error instanceof Error ? error.message : "Please try again.",
+          );
+        }
+      } finally {
+        if (!cancelled) setIsSearchingRecipients(false);
+      }
+    }, 250);
+
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [isRecipientPickerVisible, recipientSearch]);
+
+  const sendCapturedSnapTo = async (profile: ChatProfile) => {
+    if (isSendingSnap) return;
+
+    const isVideo = Boolean(videoUri);
+    if (!isVideo && !photoUri) {
+      Alert.alert("No Snap", "Capture a photo or record a video first.");
+      return;
+    }
+
+    try {
+      setIsSendingSnap(true);
+      setSendingSnapRecipientId(profile.id);
+      const conversationId = await createDirectConversation(profile.id);
+      let mediaUri = videoUri;
+
+      // Capture the photo composition so filters, drawings, stickers and caption
+      // are included in the Snap rather than uploading only the original photo.
+      if (!isVideo && snapPreviewRef.current) {
+        mediaUri = await captureRef(snapPreviewRef, {
+          format: "jpg",
+          quality: 0.92,
+          result: Platform.OS === "web" ? "data-uri" : "tmpfile",
+        });
+      }
+
+      if (!mediaUri)
+        throw new Error("Couldn't prepare this Snap. Please try again.");
+
+      await sendSnapMessage(
+        conversationId,
+        {
+          uri: mediaUri,
+          type: isVideo ? "video" : "image",
+          mimeType: isVideo ? "video/mp4" : "image/jpeg",
+          fileName: `blinksy-snap-${Date.now()}.${isVideo ? "mp4" : "jpg"}`,
+        },
+        isVideo ? "video" : "image",
+        caption,
+      );
+
+      setIsRecipientPickerVisible(false);
+      Alert.alert(
+        "Snap sent 👻",
+        `Your Snap was sent to ${profile.display_name || profile.username || "your friend"}.`,
+      );
+    } catch (error) {
+      Alert.alert(
+        "Couldn't send Snap",
+        error instanceof Error ? error.message : "Please try again.",
+      );
+    } finally {
+      setIsSendingSnap(false);
+      setSendingSnapRecipientId(null);
+    }
+  };
+
+  const renderRecipientPicker = () => (
+    <Modal
+      visible={isRecipientPickerVisible}
+      transparent
+      animationType="slide"
+      onRequestClose={() => setIsRecipientPickerVisible(false)}
+    >
+      <View style={styles.recipientModalBackdrop}>
+        <View style={styles.recipientModalCard}>
+          <View style={styles.recipientModalHeader}>
+            <Text style={styles.recipientModalTitle}>Send Snap to</Text>
+            <TouchableOpacity
+              onPress={() => setIsRecipientPickerVisible(false)}
+              accessibilityRole="button"
+              accessibilityLabel="Close recipient picker"
+            >
+              <Text style={styles.recipientModalClose}>✕</Text>
+            </TouchableOpacity>
+          </View>
+          <TextInput
+            value={recipientSearch}
+            onChangeText={setRecipientSearch}
+            placeholder="Search name or username"
+            placeholderTextColor="#8A8A95"
+            autoCapitalize="none"
+            style={styles.recipientSearchInput}
+          />
+          {isSearchingRecipients ? (
+            <ActivityIndicator
+              color="#8B5CF6"
+              style={styles.recipientLoading}
+            />
+          ) : (
+            <ScrollView
+              keyboardShouldPersistTaps="handled"
+              style={styles.recipientList}
+            >
+              {recipientProfiles.length === 0 ? (
+                <Text style={styles.recipientEmptyText}>
+                  No users found. Try another name or username.
+                </Text>
+              ) : (
+                recipientProfiles.map((profile) => (
+                  <TouchableOpacity
+                    key={profile.id}
+                    style={styles.recipientRow}
+                    onPress={() => sendCapturedSnapTo(profile)}
+                    disabled={isSendingSnap}
+                    accessibilityRole="button"
+                    accessibilityLabel={`Send Snap to ${profile.display_name || profile.username || "user"}`}
+                  >
+                    <View style={styles.recipientAvatar}>
+                      <Text style={styles.recipientAvatarText}>
+                        {(profile.display_name || profile.username || "?")
+                          .slice(0, 1)
+                          .toUpperCase()}
+                      </Text>
+                    </View>
+                    <View style={styles.recipientProfileText}>
+                      <Text style={styles.recipientName}>
+                        {profile.display_name ||
+                          profile.username ||
+                          "Blinksy user"}
+                      </Text>
+                      {profile.username ? (
+                        <Text style={styles.recipientUsername}>
+                          @{profile.username}
+                        </Text>
+                      ) : null}
+                    </View>
+                    {sendingSnapRecipientId === profile.id ? (
+                      <ActivityIndicator color="#8B5CF6" />
+                    ) : (
+                      <Text style={styles.recipientSendIcon}>👻</Text>
+                    )}
+                  </TouchableOpacity>
+                ))
+              )}
+            </ScrollView>
+          )}
+          {isSendingSnap ? (
+            <Text style={styles.sendingSnapText}>Sending your Snap…</Text>
+          ) : null}
+        </View>
+      </View>
+    </Modal>
+  );
 
   const takePhoto = async () => {
     if (!cameraRef.current || isTakingPhoto) {
@@ -494,6 +690,7 @@ export default function CameraScreen() {
     return (
       <View style={styles.previewContainer}>
         <StatusBar hidden={Platform.OS !== "web"} />
+        {renderRecipientPicker()}
         <View
           ref={snapPreviewRef}
           collapsable={false}
@@ -868,6 +1065,15 @@ export default function CameraScreen() {
             <Text style={styles.shareSnapButtonText}>📤</Text>
           </TouchableOpacity>
 
+          <TouchableOpacity
+            style={[styles.iconActionButton, styles.sendSnapActionButton]}
+            onPress={() => setIsRecipientPickerVisible(true)}
+            accessibilityRole="button"
+            accessibilityLabel="Send Snap to a friend"
+          >
+            <Text style={styles.sendSnapActionText}>👻</Text>
+          </TouchableOpacity>
+
           <View style={styles.capturedLabel}>
             <Text style={styles.capturedLabelText}>Photo captured!</Text>
           </View>
@@ -879,6 +1085,20 @@ export default function CameraScreen() {
   if (videoUri) {
     return (
       <View style={styles.videoPreviewContainer}>
+        {renderRecipientPicker()}
+        <TouchableOpacity
+          style={styles.closeButton}
+          onPress={() => {
+            videoPlayer.pause();
+            setVideoUri(null);
+            setIsVideoMode(true);
+            setCaption("");
+          }}
+          accessibilityRole="button"
+          accessibilityLabel="Discard recorded video and return to camera"
+        >
+          <Text style={styles.closeButtonText}>✕</Text>
+        </TouchableOpacity>
         <VideoView
           player={videoPlayer}
           style={styles.videoPreview}
@@ -919,6 +1139,14 @@ export default function CameraScreen() {
             onPress={shareVideo}
           >
             <Text style={styles.videoActionText}>📤</Text>
+          </TouchableOpacity>
+          <TouchableOpacity
+            style={[styles.videoActionButton, styles.videoSendSnapButton]}
+            onPress={() => setIsRecipientPickerVisible(true)}
+            accessibilityRole="button"
+            accessibilityLabel="Send video Snap to a friend"
+          >
+            <Text style={styles.videoSendSnapText}>👻 Send Snap</Text>
           </TouchableOpacity>
         </View>
       </View>
@@ -1689,6 +1917,119 @@ const styles = StyleSheet.create({
     color: "#FFFFFF",
     fontSize: 13,
     fontWeight: "700",
+  },
+  recipientModalBackdrop: {
+    flex: 1,
+    justifyContent: "flex-end",
+    backgroundColor: "rgba(0,0,0,0.62)",
+  },
+  recipientModalCard: {
+    maxHeight: "78%",
+    minHeight: 300,
+    backgroundColor: "#17171D",
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    paddingHorizontal: 20,
+    paddingTop: 20,
+    paddingBottom: 28,
+  },
+  recipientModalHeader: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+    marginBottom: 16,
+  },
+  recipientModalTitle: {
+    color: "#FFFFFF",
+    fontSize: 21,
+    fontWeight: "800",
+  },
+  recipientModalClose: {
+    color: "#FFFFFF",
+    fontSize: 22,
+    padding: 4,
+  },
+  recipientSearchInput: {
+    backgroundColor: "#292932",
+    borderRadius: 14,
+    color: "#FFFFFF",
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    fontSize: 15,
+    marginBottom: 10,
+  },
+  recipientList: {
+    flexGrow: 0,
+  },
+  recipientLoading: {
+    paddingVertical: 24,
+  },
+  recipientEmptyText: {
+    color: "#B8B8C2",
+    textAlign: "center",
+    paddingVertical: 24,
+    lineHeight: 21,
+  },
+  recipientRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    paddingVertical: 12,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: "#383842",
+  },
+  recipientAvatar: {
+    width: 42,
+    height: 42,
+    borderRadius: 21,
+    backgroundColor: "#8B5CF6",
+    alignItems: "center",
+    justifyContent: "center",
+    marginRight: 12,
+  },
+  recipientAvatarText: {
+    color: "#FFFFFF",
+    fontSize: 17,
+    fontWeight: "800",
+  },
+  recipientProfileText: {
+    flex: 1,
+  },
+  recipientName: {
+    color: "#FFFFFF",
+    fontSize: 15,
+    fontWeight: "700",
+  },
+  recipientUsername: {
+    color: "#B8B8C2",
+    fontSize: 12,
+    marginTop: 3,
+  },
+  recipientSendIcon: {
+    fontSize: 22,
+    marginLeft: 12,
+  },
+  sendingSnapText: {
+    color: "#C4B5FD",
+    textAlign: "center",
+    marginTop: 12,
+    fontWeight: "600",
+  },
+  sendSnapActionButton: {
+    backgroundColor: "#8B5CF6",
+    borderColor: "#A78BFA",
+  },
+  sendSnapActionText: {
+    color: "#FFFFFF",
+    fontSize: 22,
+    fontWeight: "800",
+  },
+  videoSendSnapButton: {
+    backgroundColor: "#8B5CF6",
+  },
+  videoSendSnapText: {
+    color: "#FFFFFF",
+    fontSize: 13,
+    fontWeight: "800",
   },
   smallIconActionButton: {
     width: 42,

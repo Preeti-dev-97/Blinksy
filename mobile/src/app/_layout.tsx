@@ -1,14 +1,15 @@
 import { useEffect, useState } from "react";
 import { ActivityIndicator, View } from "react-native";
 import type { Session } from "@supabase/supabase-js";
+import { Stack, DarkTheme, DefaultTheme, ThemeProvider } from "expo-router";
+import { useColorScheme } from "react-native";
+
 import { supabase } from "@/lib/supabase";
 import AuthScreen from "./auth";
-import { DarkTheme, DefaultTheme, ThemeProvider } from "expo-router";
-import { useColorScheme } from "react-native";
-import AppTabs from "@/components/app-tabs";
 
-export default function TabLayout() {
+export default function RootLayout() {
   const colorScheme = useColorScheme();
+
   const [session, setSession] = useState<Session | null>(null);
   const [authLoading, setAuthLoading] = useState(true);
 
@@ -56,16 +57,25 @@ export default function TabLayout() {
       subscription.unsubscribe();
     };
   }, []);
+
   return (
     <ThemeProvider value={colorScheme === "dark" ? DarkTheme : DefaultTheme}>
       {authLoading ? (
         <View
-          style={{ flex: 1, justifyContent: "center", alignItems: "center" }}
+          style={{
+            flex: 1,
+            justifyContent: "center",
+            alignItems: "center",
+          }}
         >
           <ActivityIndicator size="large" color="#8B5CF6" />
         </View>
       ) : session ? (
-        <AppTabs />
+        <Stack screenOptions={{ headerShown: false }}>
+          <Stack.Screen name="(tabs)" options={{ headerShown: false }} />
+
+          <Stack.Screen name="edit-profile" options={{ headerShown: false }} />
+        </Stack>
       ) : (
         <AuthScreen />
       )}

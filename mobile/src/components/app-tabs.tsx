@@ -59,14 +59,6 @@ export default function AppTabs() {
           renderingMode="template"
         />
       </NativeTabs.Trigger>
-
-      {/* <NativeTabs.Trigger name="edit-profile">
-        <NativeTabs.Trigger.Label>Edit Profile</NativeTabs.Trigger.Label>
-        <NativeTabs.Trigger.Icon
-          src={require("@/assets/images/tabIcons/edit-profile.png")}
-          renderingMode="template"
-        />
-      </NativeTabs.Trigger> */}
     </NativeTabs>
   );
 }

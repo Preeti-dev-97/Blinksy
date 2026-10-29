@@ -50,10 +50,6 @@ export default function AppTabs() {
             <TabTrigger name="profile" href="/profile" asChild>
               <TabButton>Profile</TabButton>
             </TabTrigger>
-
-            <TabTrigger name="edit-profile" href="/edit-profile" asChild>
-              <TabButton>Edit Profile</TabButton>
-            </TabTrigger>
           </CustomTabList>
         </TabList>
       )}

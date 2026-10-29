@@ -135,12 +135,6 @@ export default function ProfileScreen() {
           >
             <Text style={styles.primaryButtonText}>Edit Profile</Text>
           </Pressable>
-          <Pressable
-            onPress={() => router.push("/edit-profile")}
-            style={{ padding: 16, backgroundColor: "#8B5CF6" }}
-          >
-            <Text style={{ color: "#FFFFFF" }}>Test Edit Profile Route</Text>
-          </Pressable>
         </View>
 
         <Text style={styles.sectionLabel}>ACCOUNT</Text>

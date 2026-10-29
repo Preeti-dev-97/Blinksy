@@ -1,3 +1,5 @@
+import { Platform } from "react-native";
+import { File as ExpoFile } from "expo-file-system";
 import { supabase } from "@/lib/supabase";
 
 export type ChatMessage = {
@@ -11,6 +13,10 @@ export type ChatMessage = {
   created_at: string;
   edited_at: string | null;
   deleted_at: string | null;
+  is_snap: boolean;
+  snap_expires_at: string | null;
+  snap_opened_at: string | null;
+  snap_opened_by: string | null;
 };
 
 export type ChatConversation = {
@@ -126,7 +132,7 @@ export async function getMessages(conversationId: string, limit = 50) {
   const { data, error } = await supabase
     .from("messages")
     .select(
-      "id, conversation_id, sender_id, content, message_type, media_url, created_at, edited_at, deleted_at",
+      "id, conversation_id, sender_id, content, message_type, media_url, created_at, edited_at, deleted_at, is_snap, snap_expires_at, snap_opened_at, snap_opened_by",
     )
     .eq("conversation_id", conversationId)
     .order("created_at", { ascending: false })
@@ -145,7 +151,7 @@ export async function getLatestMessagesForConversations(
   const { data, error } = await supabase
     .from("messages")
     .select(
-      "id, conversation_id, sender_id, content, message_type, media_url, created_at, edited_at, deleted_at",
+      "id, conversation_id, sender_id, content, message_type, media_url, created_at, edited_at, deleted_at, is_snap, snap_expires_at, snap_opened_at, snap_opened_by",
     )
     .in("conversation_id", conversationIds)
     .order("created_at", { ascending: false });
@@ -179,7 +185,7 @@ export async function sendTextMessage(
       message_type: "text",
     })
     .select(
-      "id, conversation_id, sender_id, content, message_type, media_url, created_at, edited_at, deleted_at",
+      "id, conversation_id, sender_id, content, message_type, media_url, created_at, edited_at, deleted_at, is_snap, snap_expires_at, snap_opened_at, snap_opened_by",
     )
     .single();
 
@@ -225,15 +231,48 @@ export async function uploadChatMedia(
           ? "image/webp"
           : "image/jpeg");
 
-  // Fetching the local picker URI as a Blob works with Expo's native file URI.
-  const response = await fetch(asset.uri);
-  if (!response.ok) {
-    throw new Error("Could not read the selected media from your device.");
-  }
-  const blob = await response.blob();
-
   if (asset.fileSize && asset.fileSize > 100 * 1024 * 1024) {
     throw new Error("Please choose a file smaller than 100 MB.");
+  }
+
+  // On web, the browser can fetch data/blob URLs and upload the resulting Blob.
+  // On native, React Native's fetch does not reliably read file:// URIs. Use
+  // Expo FileSystem's File API and pass the bytes directly to Supabase Storage.
+  let uploadBody: Blob | ArrayBuffer;
+  let blobToRelease: Blob | null = null;
+
+  if (Platform.OS === "web") {
+    const response = await fetch(asset.uri);
+    if (!response.ok) {
+      throw new Error("Could not read the selected media from your device.");
+    }
+    blobToRelease = await response.blob();
+    uploadBody = blobToRelease;
+  } else {
+    try {
+      const localFile = new ExpoFile(asset.uri);
+      if (!localFile.exists) {
+        throw new Error(
+          "The captured media file no longer exists on this device.",
+        );
+      }
+      uploadBody = await localFile.arrayBuffer();
+      if (uploadBody.byteLength === 0) {
+        throw new Error(
+          "The captured media file is empty. Please capture it again.",
+        );
+      }
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        error.message.includes("captured media file")
+      ) {
+        throw error;
+      }
+      throw new Error(
+        "Could not read the selected media from your device. Please capture it again and retry.",
+      );
+    }
   }
 
   const path = `${conversationId}/${user.id}/${Date.now()}-${Math.random()
@@ -242,15 +281,15 @@ export async function uploadChatMedia(
 
   const { error } = await supabase.storage
     .from(CHAT_MEDIA_BUCKET)
-    .upload(path, blob, {
+    .upload(path, uploadBody, {
       contentType,
       upsert: false,
       cacheControl: "3600",
     });
 
   // Release Blob resources when supported by the runtime.
-  if (typeof (blob as any).close === "function") {
-    (blob as any).close();
+  if (blobToRelease && typeof (blobToRelease as any).close === "function") {
+    (blobToRelease as any).close();
   }
 
   if (error) throw error;
@@ -281,7 +320,7 @@ export async function sendMediaMessage(
       media_url: path,
     })
     .select(
-      "id, conversation_id, sender_id, content, message_type, media_url, created_at, edited_at, deleted_at",
+      "id, conversation_id, sender_id, content, message_type, media_url, created_at, edited_at, deleted_at, is_snap, snap_expires_at, snap_opened_at, snap_opened_by",
     )
     .single();
 
@@ -292,6 +331,78 @@ export async function sendMediaMessage(
   }
 
   return data as ChatMessage;
+}
+
+/**
+ * Send a photo/video as a disappearing Snap. The media remains in the private
+ * chat-media bucket and the message expires after 24 hours if unopened.
+ */
+export async function sendSnapMessage(
+  conversationId: string,
+  asset: ChatMediaAsset,
+  mediaType?: "image" | "video",
+  caption = "",
+): Promise<ChatMessage> {
+  const user = await requireUser();
+  const { path, messageType } = await uploadChatMedia(
+    conversationId,
+    asset,
+    mediaType,
+  );
+
+  const { data, error } = await supabase
+    .from("messages")
+    .insert({
+      conversation_id: conversationId,
+      sender_id: user.id,
+      content: caption.trim() || null,
+      message_type: messageType,
+      media_url: path,
+      is_snap: true,
+      snap_expires_at: new Date(Date.now() + 24 * 60 * 60 * 1000).toISOString(),
+      snap_opened_at: null,
+      snap_opened_by: null,
+    })
+    .select(
+      "id, conversation_id, sender_id, content, message_type, media_url, created_at, edited_at, deleted_at, is_snap, snap_expires_at, snap_opened_at, snap_opened_by",
+    )
+    .single();
+
+  if (error) {
+    await supabase.storage.from(CHAT_MEDIA_BUCKET).remove([path]);
+    throw error;
+  }
+
+  return data as ChatMessage;
+}
+
+/**
+ * Atomically claim a Snap via the open_snap RPC, then create a short-lived URL.
+ * The SQL function must reject senders, expired Snaps, and previously opened Snaps.
+ */
+export async function openSnapMessage(
+  messageId: string,
+): Promise<{ message: ChatMessage; mediaUri: string }> {
+  await requireUser();
+
+  const { data, error } = await supabase.rpc("open_snap", {
+    p_message_id: messageId,
+  });
+
+  if (error) throw error;
+
+  const row = Array.isArray(data) ? data[0] : data;
+  if (!row?.media_url) {
+    throw new Error(
+      "This Snap is unavailable, expired, or has already been opened.",
+    );
+  }
+
+  const mediaUri = await getChatMediaUrl(row.media_url, 180);
+  return {
+    message: row as ChatMessage,
+    mediaUri,
+  };
 }
 
 /**
@@ -339,6 +450,16 @@ export async function subscribeToMessages(
       "postgres_changes",
       {
         event: "INSERT",
+        schema: "public",
+        table: "messages",
+        filter: `conversation_id=eq.${conversationId}`,
+      },
+      (payload) => onMessage(payload.new as ChatMessage),
+    )
+    .on(
+      "postgres_changes",
+      {
+        event: "UPDATE",
         schema: "public",
         table: "messages",
         filter: `conversation_id=eq.${conversationId}`,

@@ -35,6 +35,8 @@ import {
   getMessages,
   sendTextMessage,
   sendMediaMessage,
+  sendSnapMessage,
+  openSnapMessage,
   getChatMediaUrl,
   markConversationRead,
   subscribeToMessages,
@@ -67,6 +69,10 @@ type Message = {
   messageType: "text" | "image" | "video";
   mediaPath: string | null;
   mediaUri?: string | null;
+  isSnap: boolean;
+  snapExpiresAt: string | null;
+  snapOpenedAt: string | null;
+  snapOpenedBy: string | null;
 };
 
 function ChatVideo({ uri }: { uri: string }) {
@@ -108,6 +114,14 @@ export default function ChatsScreen() {
   const [loadingMessages, setLoadingMessages] = useState(false);
   const [newChatLoading, setNewChatLoading] = useState(false);
   const [messageError, setMessageError] = useState<string | null>(null);
+  const [snapMode, setSnapMode] = useState(false);
+  const [openingSnapId, setOpeningSnapId] = useState<string | null>(null);
+  const [activeSnap, setActiveSnap] = useState<{
+    id: string;
+    uri: string;
+    type: "image" | "video";
+  } | null>(null);
+  const snapTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const subscriptionGeneration = useRef(0);
   const searchGeneration = useRef(0);
@@ -118,6 +132,12 @@ export default function ChatsScreen() {
   useEffect(() => {
     selectedChatIdRef.current = selectedChat?.id ?? null;
   }, [selectedChat?.id]);
+
+  useEffect(() => {
+    return () => {
+      if (snapTimerRef.current) clearTimeout(snapTimerRef.current);
+    };
+  }, []);
 
   const filteredChats = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -258,11 +278,13 @@ export default function ChatsScreen() {
           message: latest
             ? latest.deleted_at
               ? "Message deleted"
-              : latest.message_type === "image"
-                ? "📷 Photo"
-                : latest.message_type === "video"
-                  ? "🎥 Video"
-                  : (latest.content ?? "")
+              : latest.is_snap
+                ? "◉ Snap"
+                : latest.message_type === "image"
+                  ? "📷 Photo"
+                  : latest.message_type === "video"
+                    ? "🎥 Video"
+                    : (latest.content ?? "")
             : "Start a conversation",
           time: latest
             ? new Date(latest.created_at).toLocaleTimeString([], {
@@ -377,6 +399,10 @@ export default function ChatsScreen() {
       messageType: message.deleted_at ? "text" : message.message_type,
       mediaPath: message.deleted_at ? null : message.media_url,
       mediaUri: null,
+      isSnap: !message.deleted_at && Boolean(message.is_snap),
+      snapExpiresAt: message.snap_expires_at ?? null,
+      snapOpenedAt: message.snap_opened_at ?? null,
+      snapOpenedBy: message.snap_opened_by ?? null,
     }),
     [currentUserId],
   );
@@ -385,7 +411,21 @@ export default function ChatsScreen() {
     (conversationId: string, incoming: ChatMessage) => {
       // The list-level and open-thread subscriptions can receive the same event.
       // Handle each message ID only once so previews and unread counts don't double.
-      if (handledMessageIds.current.has(incoming.id)) return;
+      if (handledMessageIds.current.has(incoming.id)) {
+        const updated = mapMessage(incoming);
+        setMessagesByChat((previous) => {
+          const existing = previous[conversationId] ?? [];
+          return {
+            ...previous,
+            [conversationId]: existing.map((message) =>
+              message.id === updated.id
+                ? { ...message, ...updated, mediaUri: message.mediaUri }
+                : message,
+            ),
+          };
+        });
+        return;
+      }
       handledMessageIds.current.add(incoming.id);
 
       const isIncoming = incoming.sender_id !== currentUserId;
@@ -430,11 +470,13 @@ export default function ChatsScreen() {
           ...existingChat,
           message: incoming.deleted_at
             ? "Message deleted"
-            : incoming.message_type === "image"
-              ? "📷 Photo"
-              : incoming.message_type === "video"
-                ? "🎥 Video"
-                : (incoming.content ?? ""),
+            : incoming.is_snap
+              ? "◉ Snap"
+              : incoming.message_type === "image"
+                ? "📷 Photo"
+                : incoming.message_type === "video"
+                  ? "🎥 Video"
+                  : (incoming.content ?? ""),
           time: new Date(incoming.created_at).toLocaleTimeString([], {
             hour: "2-digit",
             minute: "2-digit",
@@ -477,6 +519,7 @@ export default function ChatsScreen() {
       for (const message of messages) {
         if (
           message.mediaPath &&
+          !message.isSnap &&
           !message.mediaUri &&
           !resolvingMedia.current.has(message.id)
         ) {
@@ -531,12 +574,9 @@ export default function ChatsScreen() {
           addMessage(incoming.conversation_id, incoming);
         },
       )
-      .subscribe((status, err) => {
+      .subscribe((status) => {
         if (status === "CHANNEL_ERROR" || status === "TIMED_OUT") {
           console.error("Chat list realtime subscription status:", status);
-          console.error("Chat list realtime error details:", err);
-        } else if (status === "SUBSCRIBED") {
-          console.log("Chat list realtime subscription connected.");
         }
       });
 
@@ -562,6 +602,10 @@ export default function ChatsScreen() {
         const history = await getMessages(conversationId, 100);
 
         if (!active || generation !== subscriptionGeneration.current) return;
+
+        for (const message of history) {
+          handledMessageIds.current.add(message.id);
+        }
 
         setMessagesByChat((previous) => ({
           ...previous,
@@ -774,30 +818,97 @@ export default function ChatsScreen() {
         setMessageError(null);
 
         const type = asset.type === "video" ? "video" : "image";
-        const savedMessage = await sendMediaMessage(
-          selectedChat.id,
-          {
-            uri: asset.uri,
-            type,
-            mimeType: asset.mimeType,
-            fileName: asset.fileName,
-            fileSize: asset.fileSize,
-          },
+        const mediaAsset = {
+          uri: asset.uri,
           type,
-          draft,
-        );
+          mimeType: asset.mimeType,
+          fileName: asset.fileName,
+          fileSize: asset.fileSize,
+        };
+
+        const savedMessage = snapMode
+          ? await sendSnapMessage(selectedChat.id, mediaAsset, type, draft)
+          : await sendMediaMessage(selectedChat.id, mediaAsset, type, draft);
 
         addMessage(selectedChat.id, savedMessage);
         setDraft("");
+        if (snapMode) setSnapMode(false);
         await loadConversations();
       } catch (error) {
         const message =
           error instanceof Error ? error.message : "Please try again.";
         setMessageError(message);
-        Alert.alert("Media not sent", message);
+        Alert.alert(snapMode ? "Snap not sent" : "Media not sent", message);
       } finally {
         setSending(false);
       }
+    };
+
+    const handleOpenSnap = async (message: Message) => {
+      if (
+        !message.isSnap ||
+        message.fromMe ||
+        message.snapOpenedAt ||
+        (message.snapExpiresAt &&
+          new Date(message.snapExpiresAt).getTime() <= Date.now()) ||
+        openingSnapId
+      ) {
+        return;
+      }
+
+      setOpeningSnapId(message.id);
+      setMessageError(null);
+
+      try {
+        const opened = await openSnapMessage(message.id);
+
+        setMessagesByChat((previous) => ({
+          ...previous,
+          [selectedChat.id]: (previous[selectedChat.id] ?? []).map((item) =>
+            item.id === message.id
+              ? {
+                  ...item,
+                  snapOpenedAt:
+                    opened.message.snap_opened_at ?? new Date().toISOString(),
+                  snapOpenedBy: opened.message.snap_opened_by ?? currentUserId,
+                }
+              : item,
+          ),
+        }));
+
+        const type =
+          opened.message.message_type === "video" ? "video" : "image";
+        setActiveSnap({ id: message.id, uri: opened.mediaUri, type });
+
+        if (snapTimerRef.current) clearTimeout(snapTimerRef.current);
+        // Photos are visible briefly; videos can play up to the picker limit.
+        snapTimerRef.current = setTimeout(
+          () => {
+            setActiveSnap((current) =>
+              current?.id === message.id ? null : current,
+            );
+            snapTimerRef.current = null;
+          },
+          type === "video" ? 150_000 : 20_000,
+        );
+      } catch (error) {
+        const messageText =
+          error instanceof Error
+            ? error.message
+            : "This Snap is no longer available.";
+        setMessageError(messageText);
+        Alert.alert("Snap unavailable", messageText);
+      } finally {
+        setOpeningSnapId(null);
+      }
+    };
+
+    const closeActiveSnap = () => {
+      if (snapTimerRef.current) {
+        clearTimeout(snapTimerRef.current);
+        snapTimerRef.current = null;
+      }
+      setActiveSnap(null);
     };
 
     return (
@@ -811,6 +922,7 @@ export default function ChatsScreen() {
         <View style={styles.conversationHeader}>
           <Pressable
             onPress={() => {
+              closeActiveSnap();
               selectedChatIdRef.current = null;
               setSelectedChat(null);
             }}
@@ -883,7 +995,65 @@ export default function ChatsScreen() {
                       : styles.theirMessageBubble,
                   ]}
                 >
-                  {message.messageType === "image" && message.mediaUri ? (
+                  {message.isSnap ? (
+                    <View style={styles.snapCard}>
+                      {message.snapExpiresAt &&
+                      new Date(message.snapExpiresAt).getTime() <=
+                        Date.now() ? (
+                        <Text style={styles.snapStatusText}>
+                          ⌛ Snap expired
+                        </Text>
+                      ) : message.fromMe ? (
+                        <Text style={styles.snapStatusText}>
+                          {message.snapOpenedAt ? "✓ Opened" : "◉ Snap sent"}
+                        </Text>
+                      ) : message.snapOpenedAt ? (
+                        activeSnap?.id === message.id ? (
+                          <View style={styles.openSnapContent}>
+                            {activeSnap.type === "image" ? (
+                              <Image
+                                source={{ uri: activeSnap.uri }}
+                                style={styles.mediaImage}
+                                resizeMode="cover"
+                                accessibilityLabel="Opened Snap"
+                              />
+                            ) : (
+                              <ChatVideo uri={activeSnap.uri} />
+                            )}
+                            <Pressable
+                              style={styles.closeSnapButton}
+                              onPress={closeActiveSnap}
+                            >
+                              <Text style={styles.closeSnapButtonText}>
+                                Close Snap
+                              </Text>
+                            </Pressable>
+                          </View>
+                        ) : (
+                          <Text style={styles.snapStatusText}>
+                            ✓ Snap opened
+                          </Text>
+                        )
+                      ) : (
+                        <Pressable
+                          style={styles.openSnapButton}
+                          onPress={() => void handleOpenSnap(message)}
+                          disabled={openingSnapId !== null}
+                        >
+                          {openingSnapId === message.id ? (
+                            <ActivityIndicator color="#171522" />
+                          ) : (
+                            <>
+                              <Text style={styles.openSnapIcon}>◉</Text>
+                              <Text style={styles.openSnapButtonText}>
+                                Tap to view Snap
+                              </Text>
+                            </>
+                          )}
+                        </Pressable>
+                      )}
+                    </View>
+                  ) : message.messageType === "image" && message.mediaUri ? (
                     <Image
                       source={{ uri: message.mediaUri }}
                       style={styles.mediaImage}
@@ -955,6 +1125,28 @@ export default function ChatsScreen() {
             )}
           </Pressable>
 
+          <Pressable
+            onPress={() => setSnapMode((enabled) => !enabled)}
+            disabled={sending}
+            style={[
+              styles.snapModeButton,
+              snapMode && styles.snapModeButtonActive,
+            ]}
+            accessibilityRole="button"
+            accessibilityLabel={
+              snapMode ? "Send as regular media" : "Send as disappearing Snap"
+            }
+          >
+            <Text
+              style={[
+                styles.snapModeButtonText,
+                snapMode && styles.snapModeButtonTextActive,
+              ]}
+            >
+              {snapMode ? "SNAP ✓" : "SNAP"}
+            </Text>
+          </Pressable>
+
           <TextInput
             style={styles.messageInput}
             placeholder="Message..."
@@ -1007,7 +1199,6 @@ export default function ChatsScreen() {
             </Text>
           </Pressable>
 
-          {/* Existing New Chat button */}
           <Pressable
             style={styles.newChatButton}
             onPress={() => {
@@ -1036,6 +1227,7 @@ export default function ChatsScreen() {
           clearButtonMode="while-editing"
         />
       </View>
+
       {/* Filters */}
       <View style={styles.filterRow}>
         {(["All", "Unread"] as FilterType[]).map((filter) => {
@@ -1067,6 +1259,7 @@ export default function ChatsScreen() {
           );
         })}
       </View>
+
       {/* Conversations */}
       <FlatList
         data={filteredChats}
@@ -1214,10 +1407,10 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    width: "100%",
     paddingHorizontal: 22,
     paddingTop: 12,
     paddingBottom: 22,
+    width: "100%",
   },
   eyebrow: {
     color: "#A7A0FF",
@@ -1655,6 +1848,89 @@ const styles = StyleSheet.create({
     fontSize: 27,
     lineHeight: 30,
     fontWeight: "500",
+  },
+
+  snapModeButton: {
+    minWidth: 54,
+    height: 46,
+    borderRadius: 15,
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 7,
+    backgroundColor: "#25252E",
+    borderWidth: 1,
+    borderColor: "#383842",
+  },
+
+  snapModeButtonActive: {
+    backgroundColor: "#F7D84A",
+    borderColor: "#F7D84A",
+  },
+
+  snapModeButtonText: {
+    color: "#A7A0FF",
+    fontSize: 10,
+    fontWeight: "900",
+  },
+
+  snapModeButtonTextActive: {
+    color: "#171522",
+  },
+
+  snapCard: {
+    minWidth: 150,
+    minHeight: 64,
+    justifyContent: "center",
+  },
+
+  snapStatusText: {
+    color: "#f0f0f5",
+    fontSize: 14,
+    fontWeight: "700",
+    paddingVertical: 8,
+    paddingHorizontal: 4,
+  },
+
+  openSnapButton: {
+    minWidth: 180,
+    minHeight: 72,
+    borderRadius: 16,
+    backgroundColor: "#F7D84A",
+    alignItems: "center",
+    justifyContent: "center",
+    paddingHorizontal: 18,
+    paddingVertical: 12,
+  },
+
+  openSnapIcon: {
+    color: "#171522",
+    fontSize: 24,
+    fontWeight: "900",
+  },
+
+  openSnapButtonText: {
+    color: "#171522",
+    fontSize: 13,
+    fontWeight: "800",
+    marginTop: 3,
+  },
+
+  openSnapContent: {
+    gap: 8,
+  },
+
+  closeSnapButton: {
+    alignSelf: "flex-start",
+    backgroundColor: "#F7D84A",
+    paddingVertical: 8,
+    paddingHorizontal: 13,
+    borderRadius: 12,
+  },
+
+  closeSnapButtonText: {
+    color: "#171522",
+    fontWeight: "800",
+    fontSize: 12,
   },
 
   messageInput: {
